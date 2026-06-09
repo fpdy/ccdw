@@ -19,20 +19,16 @@ Dynamic Workflowsは、作業目的を手元の宣言的な作業手順実行に
 ```text
 .
 ├── AGENTS.md
-├── docs/
-│   └── local/
-├── plugins/
-│   └── dynamic-workflows/
-│       ├── .codex-plugin/plugin.json
-│       ├── .mcp.json
-│       ├── README.md
-│       ├── package.json
-│       ├── schemas/
-│       ├── scripts/
-│       ├── skills/
-│       └── tests/
-├── skills-lock.json
-└── opencode.jsonc
+└── plugins/
+    └── dynamic-workflows/
+        ├── .codex-plugin/plugin.json
+        ├── .mcp.json
+        ├── README.md
+        ├── package.json
+        ├── schemas/
+        ├── scripts/
+        ├── skills/
+        └── tests/
 ```
 
 `docs/local` は、一時的な手元の文書、動作確認の出力、作業用成果物の置き場です。

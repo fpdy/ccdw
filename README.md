@@ -21,20 +21,16 @@ directly.
 ```text
 .
 ├── AGENTS.md
-├── docs/
-│   └── local/
-├── plugins/
-│   └── dynamic-workflows/
-│       ├── .codex-plugin/plugin.json
-│       ├── .mcp.json
-│       ├── README.md
-│       ├── package.json
-│       ├── schemas/
-│       ├── scripts/
-│       ├── skills/
-│       └── tests/
-├── skills-lock.json
-└── opencode.jsonc
+└── plugins/
+    └── dynamic-workflows/
+        ├── .codex-plugin/plugin.json
+        ├── .mcp.json
+        ├── README.md
+        ├── package.json
+        ├── schemas/
+        ├── scripts/
+        ├── skills/
+        └── tests/
 ```
 
 `docs/local` is reserved for ephemeral local documents, smoke-test outputs, and
