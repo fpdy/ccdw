@@ -31,8 +31,8 @@ Dynamic Workflowsは、作業目的を手元の宣言的な作業手順実行に
         └── tests/
 ```
 
-`docs/local` は、一時的な手元の文書、動作確認の出力、作業用成果物の置き場です。
-このディレクトリ内のファイルは、永続的なプロジェクト文書として扱わないでください。
+ccdwが管理する手元の状態ファイルと生成成果物は、初期設定では `.ccdw/` に保存されます。
+保存先を変えるには `CCDW_HOME` を設定します。相対パスはワークスペースルートから解決されます。
 
 ## Dynamic Workflows
 
@@ -176,11 +176,12 @@ MCPの操作口は、Dynamic Workflows実行の計画作成、承認、実行、
 
 ## 手元の成果物
 
-初期設定の作業手順実行は `.codex-dynamic-workflows/runs` に書き込まれます。
+初期設定の作業手順実行は `.ccdw/dynamic-workflows/runs` に書き込まれます。
 この経路はリポジトリの `.gitignore` で無視されます。
 
-開発中または挙動検証中に役立つ手元のメモ、動作確認の出力、一時レポートには
-`docs/local` を使います。
+ccdwが管理する手元の状態ファイルの保存先を変えるには `CCDW_HOME` を設定します。
+Dynamic Workflowsは `<CCDW_HOME>/dynamic-workflows/runs` に実行を保存します。
+CLIの `--run-root` またはMCPの `runRoot` を明示した場合は、その実行では `CCDW_HOME` より優先されます。
 
 ## 問題への対処
 

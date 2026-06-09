@@ -15,11 +15,15 @@ command. Invoke the bundled skill or call the runner directly.
 
 ```bash
 node scripts/dynamic-workflows.js plan --objective "Review this repository" --json
-node scripts/dynamic-workflows.js run --run-dir .codex-dynamic-workflows/runs/<run_id> --approve --json
-node scripts/dynamic-workflows.js status --run-dir .codex-dynamic-workflows/runs/<run_id> --json
-node scripts/dynamic-workflows.js resume --run-dir .codex-dynamic-workflows/runs/<run_id> --json
-node scripts/dynamic-workflows.js cancel --run-dir .codex-dynamic-workflows/runs/<run_id> --reason "No longer needed" --json
+node scripts/dynamic-workflows.js run --run-dir .ccdw/dynamic-workflows/runs/<run_id> --approve --json
+node scripts/dynamic-workflows.js status --run-dir .ccdw/dynamic-workflows/runs/<run_id> --json
+node scripts/dynamic-workflows.js resume --run-dir .ccdw/dynamic-workflows/runs/<run_id> --json
+node scripts/dynamic-workflows.js cancel --run-dir .ccdw/dynamic-workflows/runs/<run_id> --reason "No longer needed" --json
 ```
+
+By default, runs are stored under `.ccdw/dynamic-workflows/runs`. Set
+`CCDW_HOME` to relocate ccdw-managed local state, or pass `--run-root` for a
+single run.
 
 The first implementation uses a deterministic local worker executor so the
 state machine, approval gate, event log, resume path, and schema validation can

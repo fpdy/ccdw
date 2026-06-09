@@ -1,2 +1,2 @@
-- emphemeral documents are stored in `docs/local`. Git ignores them by default.
-- Responses should be generated in Japanese.
+- ccdw-managed local state and generated artifacts are stored under `.ccdw` by default.
+- Set `CCDW_HOME` to relocate ccdw-managed local state; relative values resolve from the workspace root.

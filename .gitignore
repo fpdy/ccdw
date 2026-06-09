@@ -1,11 +1,11 @@
-# Local Dynamic Workflows runs
+# ccdw local runtime state and generated artifacts
+.ccdw/
+
+# Legacy local Dynamic Workflows runs
 .codex-dynamic-workflows/
 
 # Dependency installs
 node_modules/
-
-# Ephemeral local documents and smoke-test output
-docs/local/
 
 # ssctl local runtime state and report copies
 .ssctl/
@@ -16,4 +16,3 @@ opencode.jsonc
 .codex/
 .agents/
 skills-lock.json
-

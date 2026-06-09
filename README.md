@@ -33,9 +33,9 @@ directly.
         └── tests/
 ```
 
-`docs/local` is reserved for ephemeral local documents, smoke-test outputs, and
-other working artifacts. Do not treat files in that directory as durable project
-documentation.
+ccdw-managed local state and generated artifacts are stored under `.ccdw/` by
+default. Set `CCDW_HOME` to relocate that state; relative values are resolved
+from the workspace root.
 
 ## Dynamic Workflows
 
@@ -181,11 +181,12 @@ reading status, cancelling, and validating Dynamic Workflows runs.
 
 ## Local Artifacts
 
-Default workflow runs are written under `.codex-dynamic-workflows/runs`, which
-is ignored by this repository's `.gitignore`.
+Default workflow runs are written under `.ccdw/dynamic-workflows/runs`, which is
+ignored by this repository's `.gitignore`.
 
-Use `docs/local` for local notes, smoke-test outputs, and temporary reports that
-are useful while developing or verifying behavior.
+Set `CCDW_HOME` to relocate ccdw-managed local state. Dynamic Workflows stores
+runs under `<CCDW_HOME>/dynamic-workflows/runs`; an explicit CLI `--run-root` or
+MCP `runRoot` value overrides `CCDW_HOME` for that run.
 
 ## Troubleshooting
 

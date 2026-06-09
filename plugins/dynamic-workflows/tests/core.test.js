@@ -21,6 +21,24 @@ function makeTempWorkspace() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "dw-test-"));
 }
 
+function withEnv(name, value, callback) {
+  const original = process.env[name];
+  if (value == null) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+  try {
+    return callback();
+  } finally {
+    if (original == null) {
+      delete process.env[name];
+    } else {
+      process.env[name] = original;
+    }
+  }
+}
+
 test("planWorkflow creates an approval-gated run directory", () => {
   const workspace = makeTempWorkspace();
   const result = planWorkflow({
@@ -35,6 +53,61 @@ test("planWorkflow creates an approval-gated run directory", () => {
   assert.ok(fs.existsSync(result.paths.event_log));
   assert.ok(fs.existsSync(result.paths.artifacts));
   assert.equal(validateRunDirectory({ runDir: result.run_dir }).valid, true);
+});
+
+test("planWorkflow stores runs under workspace .ccdw by default", () => {
+  const workspace = makeTempWorkspace();
+  const result = withEnv("CCDW_HOME", null, () =>
+    planWorkflow({
+      objective: "Use the default ccdw home",
+      workspace,
+      runId: "default-run",
+    }),
+  );
+
+  assert.equal(result.run_dir, path.join(workspace, ".ccdw", "dynamic-workflows", "runs", "default-run"));
+});
+
+test("planWorkflow honors CCDW_HOME when no run root is provided", () => {
+  const workspace = makeTempWorkspace();
+  const ccdwHome = path.join(makeTempWorkspace(), "state");
+  const result = withEnv("CCDW_HOME", ccdwHome, () =>
+    planWorkflow({
+      objective: "Use an environment configured ccdw home",
+      workspace,
+      runId: "env-run",
+    }),
+  );
+
+  assert.equal(result.run_dir, path.join(ccdwHome, "dynamic-workflows", "runs", "env-run"));
+});
+
+test("planWorkflow resolves relative CCDW_HOME from the workspace root", () => {
+  const workspace = makeTempWorkspace();
+  const result = withEnv("CCDW_HOME", "custom-ccdw", () =>
+    planWorkflow({
+      objective: "Use a relative environment configured ccdw home",
+      workspace,
+      runId: "relative-env-run",
+    }),
+  );
+
+  assert.equal(result.run_dir, path.join(workspace, "custom-ccdw", "dynamic-workflows", "runs", "relative-env-run"));
+});
+
+test("planWorkflow prefers explicit runRoot over CCDW_HOME", () => {
+  const workspace = makeTempWorkspace();
+  const ccdwHome = path.join(workspace, "ignored-home");
+  const result = withEnv("CCDW_HOME", ccdwHome, () =>
+    planWorkflow({
+      objective: "Use the explicit run root",
+      workspace,
+      runRoot: "explicit-runs",
+      runId: "explicit-run",
+    }),
+  );
+
+  assert.equal(result.run_dir, path.join(workspace, "explicit-runs", "explicit-run"));
 });
 
 test("runWorkflow enforces approval and completes all local tasks", () => {

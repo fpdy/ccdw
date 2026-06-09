@@ -4,7 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SCHEMA_VERSION = "dynamic-workflows.v1";
-export const DEFAULT_RUN_ROOT = ".codex-dynamic-workflows/runs";
+export const CCDW_HOME_ENV = "CCDW_HOME";
+export const DEFAULT_CCDW_HOME = ".ccdw";
+export const DEFAULT_RUN_ROOT = ".ccdw/dynamic-workflows/runs";
 export const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 const RUN_STATE_FILE = "run.json";
@@ -990,9 +992,15 @@ function countEvents(runDir) {
 
 function resolveRunRoot(runRoot, workspace) {
   if (runRoot == null) {
-    return path.join(workspace, DEFAULT_RUN_ROOT);
+    const configuredHome = process.env[CCDW_HOME_ENV]?.trim();
+    const ccdwHome = configuredHome || DEFAULT_CCDW_HOME;
+    return path.join(resolveWorkspacePath(ccdwHome, workspace), "dynamic-workflows", "runs");
   }
-  return path.isAbsolute(runRoot) ? runRoot : path.resolve(workspace, runRoot);
+  return resolveWorkspacePath(runRoot, workspace);
+}
+
+function resolveWorkspacePath(candidate, workspace) {
+  return path.isAbsolute(candidate) ? candidate : path.resolve(workspace, candidate);
 }
 
 function requireRunDir(runDir) {
