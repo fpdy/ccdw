@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.codex.dynamic-workflows/schemas/workflow.schema.json",
+  "title": "Dynamic Workflows WorkflowSpec",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "workflow_id",
+    "name",
+    "objective",
+    "phases",
+    "tasks",
+    "max_concurrency",
+    "max_agents",
+    "max_tokens",
+    "max_cost",
+    "max_duration_ms",
+    "max_retries",
+    "max_no_progress_iterations",
+    "required_capabilities",
+    "workspace_policy",
+    "verification_policy",
+    "stop_conditions"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "workflow_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "name": { "type": "string" },
+    "objective": { "type": "string" },
+    "phases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/phase" },
+      "minItems": 1
+    },
+    "tasks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/task" },
+      "minItems": 1
+    },
+    "max_concurrency": { "type": "integer", "minimum": 1 },
+    "max_agents": { "type": "integer", "minimum": 1 },
+    "max_tokens": { "type": "integer", "minimum": 0 },
+    "max_cost": { "type": "number", "minimum": 0 },
+    "max_duration_ms": { "type": "integer", "minimum": 1 },
+    "max_retries": { "type": "integer", "minimum": 0 },
+    "max_no_progress_iterations": { "type": "integer", "minimum": 0 },
+    "required_capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "workspace_policy": { "type": "object" },
+    "verification_policy": { "type": "object" },
+    "stop_conditions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "required": [
+        "phase_id",
+        "name",
+        "depends_on",
+        "entry_condition",
+        "tasks",
+        "completion_condition",
+        "verification_required",
+        "on_failure",
+        "outputs"
+      ],
+      "properties": {
+        "phase_id": { "type": "string" },
+        "name": { "type": "string" },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "entry_condition": { "type": "string" },
+        "tasks": { "type": "array", "items": { "type": "string" } },
+        "completion_condition": { "type": "string" },
+        "verification_required": { "type": "boolean" },
+        "on_failure": { "type": "string" },
+        "outputs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "phase_id",
+        "kind",
+        "role",
+        "prompt_template",
+        "input_source",
+        "depends_on",
+        "expected_output_schema",
+        "retry_policy",
+        "verification_required",
+        "stop_condition",
+        "outputs"
+      ],
+      "properties": {
+        "task_id": { "type": "string" },
+        "phase_id": { "type": "string" },
+        "kind": { "type": "string" },
+        "role": { "type": "string" },
+        "prompt_template": { "type": "string" },
+        "input_source": { "type": "string" },
+        "fanout_source": { "type": ["string", "null"] },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "condition": { "type": "string" },
+        "expected_output_schema": { "type": "string" },
+        "retry_policy": { "type": "object" },
+        "verification_required": { "type": "boolean" },
+        "stop_condition": { "type": "string" },
+        "outputs": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

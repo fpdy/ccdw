@@ -1,0 +1,19 @@
+# Local Dynamic Workflows runs
+.codex-dynamic-workflows/
+
+# Dependency installs
+node_modules/
+
+# Ephemeral local documents and smoke-test output
+docs/local/
+
+# ssctl local runtime state and report copies
+.ssctl/
+.agent-results/
+
+# agents
+opencode.jsonc
+.codex/
+.agents/
+skills-lock.json
+

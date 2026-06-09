@@ -1,0 +1,28 @@
+{
+  "name": "dynamic-workflows",
+  "version": "0.1.0+codex.20260609020831",
+  "description": "Plan, run, resume, and audit local declarative workflows for Codex tasks.",
+  "author": {
+    "name": "fpdy"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Dynamic Workflows",
+    "shortDescription": "Run declarative Codex workflow plans locally.",
+    "longDescription": "Dynamic Workflows gives Codex a local workflow runner with approval gates, run snapshots, append-only events, resume, cancellation, structured worker results, and an optional MCP interface. It intentionally does not hook or replace the built-in /goal command.",
+    "developerName": "fpdy",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#2563EB",
+    "defaultPrompt": [
+      "Plan and run this task with Dynamic Workflows.",
+      "Show the status of a Dynamic Workflows run.",
+      "Resume a paused Dynamic Workflows run."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

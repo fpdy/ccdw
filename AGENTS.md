@@ -1,0 +1,2 @@
+- emphemeral documents are stored in `docs/local`. Git ignores them by default.
+- Responses should be generated in Japanese.

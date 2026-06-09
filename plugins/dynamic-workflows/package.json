@@ -1,0 +1,13 @@
+{
+  "name": "dynamic-workflows-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "dynamic-workflows": "./scripts/dynamic-workflows.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "validate": "node scripts/dynamic-workflows.js validate-plugin-layout --json"
+  }
+}

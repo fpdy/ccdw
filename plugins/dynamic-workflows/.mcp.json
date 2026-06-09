@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "dynamic-workflows": {
+      "command": "node",
+      "args": [
+        "./scripts/dynamic-workflows-mcp.js"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 120
+    }
+  }
+}

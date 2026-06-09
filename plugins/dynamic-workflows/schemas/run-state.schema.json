@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.codex.dynamic-workflows/schemas/run-state.schema.json",
+  "title": "Dynamic Workflows RunState",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "goal_id",
+    "status",
+    "current_phase",
+    "created_at",
+    "updated_at",
+    "tasks",
+    "attempts",
+    "artifacts",
+    "locks",
+    "budget_usage",
+    "event_log_offset"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "run_id": { "type": "string" },
+    "goal_id": { "type": ["string", "null"] },
+    "status": {
+      "enum": [
+        "planned",
+        "awaiting_approval",
+        "approved",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "current_phase": { "type": ["string", "null"] },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" },
+    "tasks": { "type": "object" },
+    "attempts": { "type": "object" },
+    "artifacts": { "type": "array" },
+    "locks": { "type": "object" },
+    "budget_usage": { "type": "object" },
+    "event_log_offset": { "type": "integer", "minimum": 0 }
+  }
+}

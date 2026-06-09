@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.codex.dynamic-workflows/schemas/worker-result.schema.json",
+  "title": "Dynamic Workflows WorkerResult",
+  "type": "object",
+  "required": [
+    "task_id",
+    "attempt_id",
+    "status",
+    "summary",
+    "findings",
+    "errors",
+    "evidence",
+    "modified_files",
+    "commands_run",
+    "artifacts"
+  ],
+  "properties": {
+    "task_id": { "type": "string" },
+    "attempt_id": { "type": "string" },
+    "status": { "enum": ["succeeded", "failed"] },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "errors": { "type": "array", "items": { "type": "string" } },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "modified_files": { "type": "array", "items": { "type": "string" } },
+    "commands_run": { "type": "array", "items": { "type": "string" } },
+    "artifacts": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "claim",
+        "evidence",
+        "source_files",
+        "confidence",
+        "severity",
+        "verification_status",
+        "verifier_notes",
+        "rejection_reason"
+      ],
+      "properties": {
+        "claim": { "type": "string" },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "source_files": { "type": "array", "items": { "type": "string" } },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "severity": { "type": "string" },
+        "verification_status": {
+          "enum": ["unverified", "verified", "rejected", "unresolved"]
+        },
+        "verifier_notes": { "type": "string" },
+        "rejection_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
