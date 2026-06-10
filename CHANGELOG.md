@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.1 - 2026-06-10
+
+### Fixed
+
+- `run --detach --json` from the CLI no longer exits 0 with empty stdout: the detach startup poll awaited an unref'd timer while the spawned child and log descriptor were already released, so a bare CLI process drained its event loop and exited before printing the summary (and before the v0.3.0 dead-runner detection could ever fire). The poll now uses a ref'd timer; the orchestrator-loop sleeps stay unref'd. Covered by a CLI-subprocess regression test, since in-process tests cannot reproduce the early exit.
+- Plan-time strict validation now checks `input_source`: only `null`, `"objective"`, `"accepted_worker_results"`, a non-empty path string, or an array of non-empty path strings are accepted. Previously `input_source: [123]` passed `--dry-run` as valid and failed at runtime with a `path` TypeError in the executor. Stored runs are still re-read leniently.
+
+### Documentation
+
+- SKILL.md's planning rules document the accepted `input_source` forms.
+
 ## v0.3.0 - 2026-06-10
 
 ### Changed (breaking for new plans)

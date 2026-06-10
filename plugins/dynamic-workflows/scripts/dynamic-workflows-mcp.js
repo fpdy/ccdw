@@ -15,7 +15,7 @@ import fs from "node:fs";
 
 const serverInfo = {
   name: "dynamic-workflows",
-  version: "0.3.0",
+  version: "0.3.1",
 };
 
 const tools = [

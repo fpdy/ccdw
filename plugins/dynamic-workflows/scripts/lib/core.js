@@ -550,7 +550,9 @@ export async function detachWorkflowRun(options = {}) {
   // entirely inside this window, which exits 0 and is fine.
   const pollDeadline = Date.now() + 2000;
   while (Date.now() < pollDeadline && childExit == null && !readLiveLock(runDir)) {
-    await sleep(50);
+    // The child and logFd are already released, so an unref'd timer would let
+    // a bare CLI process exit 0 before this promise resolves (empty stdout).
+    await sleep(50, { unref: false });
   }
   if (childExit != null && (childExit.signal != null || childExit.code !== 0)) {
     throw new WorkflowError("Detached runner exited before executing the run; see the runner log.", {
@@ -811,6 +813,7 @@ export function validateWorkflowSpec(workflow, options = {}) {
           `task ${task.task_id} fanout_source is not executed by the runner; expand fan-out at plan time and leave it null`,
         );
       }
+      validateInputSource(task, errors);
     }
     if (taskIds.has(task.task_id)) {
       errors.push(`duplicate task_id: ${task.task_id}`);
@@ -2218,6 +2221,27 @@ function validateSpecId(value, label, errors) {
   }
 }
 
+function validateInputSource(task, errors) {
+  const source = task.input_source;
+  if (source == null || source === "objective" || source === "accepted_worker_results") {
+    return;
+  }
+  const message = `task ${task.task_id} input_source must be null, "objective", "accepted_worker_results", a non-empty path string, or an array of non-empty path strings`;
+  if (typeof source === "string") {
+    if (source.length === 0) {
+      errors.push(message);
+    }
+    return;
+  }
+  if (Array.isArray(source)) {
+    if (!source.every((entry) => typeof entry === "string" && entry.length > 0)) {
+      errors.push(message);
+    }
+    return;
+  }
+  errors.push(message);
+}
+
 function validateRetryPolicy(policy, errors, prefix) {
   if (!isPlainObject(policy)) {
     return;
@@ -2404,9 +2428,11 @@ function libDirectory() {
   return path.dirname(fileURLToPath(import.meta.url));
 }
 
-function sleep(ms) {
+function sleep(ms, { unref = true } = {}) {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    if (unref) {
+      timer.unref?.();
+    }
   });
 }

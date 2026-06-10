@@ -1106,6 +1106,53 @@ test("detach surfaces a runner that dies before executing the run", async () => 
   await assert.rejects(() => detachWorkflowRun({ runDir: planned.run_dir }), /runner log/);
 });
 
+test("CLI run --detach prints the detach summary before the process exits", async () => {
+  // Regression: the detach poll awaited an unref'd timer, so a bare CLI
+  // process (no other ref'd handles) exited 0 with empty stdout before the
+  // summary was printed. Only a real CLI subprocess reproduces this; inside
+  // the test process other handles keep the event loop alive.
+  const workspace = makeTempWorkspace();
+  const cli = path.join(pluginRoot, "scripts", "dynamic-workflows.js");
+  const planned = planWorkflow({ objective: "Detach through the CLI", workspace });
+
+  const output = execFileSync(
+    "node",
+    [cli, "run", "--run-dir", planned.run_dir, "--detach", "--approve", "--json"],
+    { encoding: "utf8" },
+  );
+
+  assert.ok(output.length > 0, "expected the detach summary on stdout");
+  const detached = JSON.parse(output);
+  assert.equal(detached.detached, true);
+  assert.equal(detached.run_dir, planned.run_dir);
+
+  const finished = await pollUntil(
+    () => readRunState(planned.run_dir).status === "completed",
+  );
+  assert.ok(finished, "expected the detached run to complete");
+});
+
+test("plan strictly rejects malformed input_source values", () => {
+  const workspace = makeTempWorkspace();
+  const dryRun = (inputSource) =>
+    planWorkflow({
+      workspace,
+      dryRun: true,
+      spec: singleCodexTaskSpec({ input_source: inputSource }),
+    });
+
+  for (const malformed of [[123], {}, [""], 5, ""]) {
+    const result = dryRun(malformed);
+    assert.equal(result.valid, false, `expected ${JSON.stringify(malformed)} to be rejected`);
+    assert.ok(result.errors.some((message) => message.includes("task t1 input_source")));
+  }
+
+  for (const accepted of [null, "objective", "accepted_worker_results", "inputs/seed.json", ["a.json", "b.json"]]) {
+    const result = dryRun(accepted);
+    assert.equal(result.valid, true, `expected ${JSON.stringify(accepted)} to be accepted`);
+  }
+});
+
 function createMcpClient(child, options = {}) {
   const framing = options.framing ?? "headers";
   const requestDelimiter = options.requestDelimiter ?? "\r\n\r\n";

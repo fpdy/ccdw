@@ -1,6 +1,6 @@
 {
   "name": "dynamic-workflows",
-  "version": "0.3.0+codex.20260610",
+  "version": "0.3.1+codex.20260610",
   "description": "Plan, run, resume, and audit local declarative workflows for Codex tasks.",
   "author": {
     "name": "fpdy"
