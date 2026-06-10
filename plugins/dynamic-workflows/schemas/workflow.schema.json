@@ -118,8 +118,15 @@
         "role": { "type": "string" },
         "prompt_template": { "type": "string" },
         "input_source": {
-          "type": ["string", "array"],
-          "items": { "type": "string" }
+          "anyOf": [
+            { "type": "string", "enum": ["objective", "accepted_worker_results"] },
+            { "type": "string", "minLength": 1, "pattern": "\\S" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+            }
+          ]
         },
         "fanout_source": { "const": null },
         "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },

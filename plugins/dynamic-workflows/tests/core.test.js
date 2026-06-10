@@ -1141,16 +1141,44 @@ test("plan strictly rejects malformed input_source values", () => {
       spec: singleCodexTaskSpec({ input_source: inputSource }),
     });
 
-  for (const malformed of [[123], {}, [""], 5, ""]) {
+  const malformedInputs = [[123], {}, [""], ["   "], ["ok.json", ""], ["ok.json", "   "], [], 5, "", "   "];
+  for (const malformed of malformedInputs) {
     const result = dryRun(malformed);
     assert.equal(result.valid, false, `expected ${JSON.stringify(malformed)} to be rejected`);
     assert.ok(result.errors.some((message) => message.includes("task t1 input_source")));
   }
 
-  for (const accepted of [null, "objective", "accepted_worker_results", "inputs/seed.json", ["a.json", "b.json"]]) {
+  const acceptedInputs = [null, "objective", "accepted_worker_results", "inputs/seed.json", ["a.json", "b.json"]];
+  for (const accepted of acceptedInputs) {
     const result = dryRun(accepted);
     assert.equal(result.valid, true, `expected ${JSON.stringify(accepted)} to be accepted`);
   }
+
+  assert.equal(dryRun(null).workflow.tasks[0].input_source, "objective");
+  assert.equal(planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleCodexTaskSpec(),
+  }).workflow.tasks[0].input_source, "objective");
+});
+
+test("workflow schema documents normalized input_source forms", () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(pluginRoot, "schemas", "workflow.schema.json"), "utf8"));
+  const inputSource = schema.$defs.task.properties.input_source;
+
+  assert.ok(inputSource.anyOf.some((entry) =>
+    entry.type === "string" && entry.enum?.includes("objective") && entry.enum?.includes("accepted_worker_results"),
+  ));
+  assert.ok(inputSource.anyOf.some((entry) =>
+    entry.type === "string" && entry.minLength === 1 && entry.pattern === "\\S",
+  ));
+  assert.ok(inputSource.anyOf.some((entry) =>
+    entry.type === "array" &&
+      entry.minItems === 1 &&
+      entry.items?.type === "string" &&
+      entry.items?.minLength === 1 &&
+      entry.items?.pattern === "\\S",
+  ));
 });
 
 function createMcpClient(child, options = {}) {

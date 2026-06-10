@@ -86,8 +86,9 @@ Rules for good specs:
   `"dependencies_succeeded"`, `completion_condition` only
   `"all_tasks_succeeded"`, and task `stop_condition` only
   `"budget_or_cancelled"`. Plan rejects anything else.
-- `input_source` must be `null`, `"objective"`, `"accepted_worker_results"`,
-  a non-empty path string, or an array of non-empty path strings; paths
+- Omitted or `null` `input_source` values normalize to `"objective"`.
+  Explicit values must be `"objective"`, `"accepted_worker_results"`, a
+  non-empty path string, or a non-empty array of non-empty path strings; paths
   resolve relative to the run directory.
 - Keep `max_concurrency` low (2-4); each worker is a full Codex session.
 - Set per-task `timeout_ms` and a run-level `max_tokens`; the runner enforces

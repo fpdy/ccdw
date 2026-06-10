@@ -2226,15 +2226,15 @@ function validateInputSource(task, errors) {
   if (source == null || source === "objective" || source === "accepted_worker_results") {
     return;
   }
-  const message = `task ${task.task_id} input_source must be null, "objective", "accepted_worker_results", a non-empty path string, or an array of non-empty path strings`;
+  const message = `task ${task.task_id} input_source must be null, "objective", "accepted_worker_results", a non-empty path string, or a non-empty array of non-empty path strings`;
   if (typeof source === "string") {
-    if (source.length === 0) {
+    if (source.trim() === "") {
       errors.push(message);
     }
     return;
   }
   if (Array.isArray(source)) {
-    if (!source.every((entry) => typeof entry === "string" && entry.length > 0)) {
+    if (source.length === 0 || !source.every((entry) => typeof entry === "string" && entry.trim() !== "")) {
       errors.push(message);
     }
     return;
