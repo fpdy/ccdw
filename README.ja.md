@@ -7,8 +7,8 @@
 このリポジトリは、現在手元で使うCodexエージェント関連ファイルと
 Dynamic Workflows拡張機能の実装を管理しています。
 
-Dynamic Workflowsは、作業計画を本物の `codex exec` サブエージェントで実行する
-手元の宣言的な作業手順実行に変換します。呼び出し側エージェントがWorkflowSpec
+Dynamic Workflowsは、作業計画を本物の `codex exec` または `claude -p`
+サブエージェントで実行する手元の宣言的な作業手順実行に変換します。呼び出し側エージェントがWorkflowSpec
 (JSON) を書き、実行プログラムがそれを検証し、上限を超えたら安全側で停止する
 予算管理のもとでタスクを並列スケジュールします。作業手順の仕様、実行状態、
 追記型の処理記録、作業成果物を保存し、承認、実行、監視、再開、取り消しが
@@ -48,7 +48,7 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
 - `events.ndjson`: 追記型の処理記録と監査記録。
 - `artifacts/`: 構造化された作業結果と試行ごとの生出力。
 
-実行処理は2種類組み込まれています。
+実行処理は3種類組み込まれています。
 
 - **codex実行**: `kind` が `codex` で始まるタスクは `codex exec` の
   子プロセスとして実行されます。JSONLイベントストリーム、スキーマで強制した
@@ -56,8 +56,18 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
   許可しない限り読み取り専用)、プロセスグループへの段階的シグナルによる
   タスク単位のタイムアウト、実行予算へのトークン使用量の計上を行います。
   バイナリは `CCDW_CODEX_BIN` で差し替えられます。
+- **claude実行**: `kind` が `claude` で始まるタスクはClaude Codeの
+  `claude -p` の子プロセスとして実行されます。stream-jsonイベントストリーム、
+  同じスキーマで強制した構造化出力、`workspace_policy` から導出した
+  OSサンドボックス (仕様で書き込みを許可しない限り読み取り専用)、周囲の設定と
+  カスタマイズの除外、実行予算へのトークン使用量の計上を行います。
+  バイナリは `CCDW_CLAUDE_BIN` で差し替えられます。周囲の設定を除外するため、
+  `apiKeyHelper` による認証はworkerには使えません (代わりに
+  `ANTHROPIC_API_KEY` を設定してください)。ユーザー設定の `model` も
+  適用されないため、タスクの `model` フィールドを使ってください。claudeタスクを
+  含む作業手順では `workspace_policy.network:true` は計画時に拒否されます。
 - **ローカル実行**: `local_*` のタスク種別は毎回同じ結果になる手元の実行処理で、
-  既定テンプレートとテスト一式が使います。Codexセッションは起動しません。
+  既定テンプレートとテスト一式が使います。LLMセッションは起動しません。
 
 スケジューラはフェーズ/タスクDAG上のready-queueです。依存が満たされたタスクから
 `max_concurrency` まで並列に実行し、`max_tokens`、`max_duration_ms`、
@@ -68,20 +78,21 @@ Workflowの `phase_id` と `task_id` は
 書き込み先も解決後に検証されるため、タスクID経由で実行ディレクトリ内の
 `artifacts/` の外へ書き出すことはできません。
 
-承認サマリには、実際に強制されるCodexサンドボックスが表示されます。workerは
+承認サマリには、実際に強制されるworkerサンドボックスが表示されます。workerは
 `workspace_policy.write_scope` に `"workspace"` が含まれない限り読み取り専用で
-実行されます。networkはworkspace-writeモードでのみ対応します。
+実行されます。networkはcodexタスクのworkspace-writeモードでのみ対応します。
 `workspace_policy.shell:true` と `workspace_policy.mcp_write:true` は、現在の
-Codex起動では強制できないため実行側が拒否します。
+worker起動では強制できないため実行側が拒否します。
 
 ## 必要環境
 
 - ESM対応のNode.js。
 - 拡張機能のテストスクリプトを実行するためのnpm。
 - codexタスクを使う作業手順では、PATH上の `codex` CLI。
+- claudeタスクを使う作業手順では、PATH上の `claude` CLI (2.1.x以降)。
 
-テスト一式ではパッケージインストールは不要です。codex実行は同梱の擬似バイナリで
-テストされます。
+テスト一式ではパッケージインストールは不要です。codex実行とclaude実行は同梱の
+擬似バイナリでテストされます。
 
 ## はじめに
 
@@ -122,7 +133,8 @@ node plugins/dynamic-workflows/scripts/dynamic-workflows.js plan \
   --spec-file my-workflow.json --dry-run --json
 ```
 
-承認ゲートを通してバックグラウンドで実行します (codexタスクでは推奨)。
+承認ゲートを通してバックグラウンドで実行します (codex/claudeの
+サブエージェントタスクでは推奨)。
 
 ```bash
 node plugins/dynamic-workflows/scripts/dynamic-workflows.js run \
@@ -208,6 +220,9 @@ npm test
   `maxTasks` の拒否)。
 - 同梱の擬似codexバイナリによるcodex実行 (JSONL解析、thread id記録、
   スキーマ違反の隔離、再試行ポリシー)。
+- 同梱の擬似claudeバイナリによるclaude実行 (実行処理の振り分け、
+  終了コード0でも `is_error` なら失敗とする判定、構造化出力のスキーマ違反の
+  隔離、一箇所での予算計上、networkの計画時拒否)。
 - 実行中の取り消し (制御チャネル経由) と計画済み実行の取り消し。
 - バックグラウンド実行と異常終了からの再開 (`--resume-failed` を含む)、
   および強制再計画時の古い状態削除。

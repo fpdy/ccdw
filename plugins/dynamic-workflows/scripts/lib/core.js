@@ -11,6 +11,12 @@ import {
   startCodexExec,
   WORKER_OUTPUT_SCHEMA,
 } from "./codex-executor.js";
+import {
+  buildClaudeExecArgs,
+  buildClaudeSandboxSettings,
+  resolveClaudeBin,
+  startClaudeExec,
+} from "./claude-executor.js";
 
 export const SCHEMA_VERSION = "dynamic-workflows.v1";
 export const CCDW_HOME_ENV = "CCDW_HOME";
@@ -28,6 +34,7 @@ const CONTROL_DIR = "control";
 const CANCEL_SIGNAL_FILE = "cancel.json";
 const RUNNER_LOG_FILE = "runner.log";
 const WORKER_SCHEMA_FILE = "worker-output.schema.json";
+const CLAUDE_SETTINGS_FILE = "claude-settings.json";
 const SPEC_ID_PATTERN_DESCRIPTION = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 const PARTIAL_RESULT_POLICIES = new Set(["quarantine", "accept", "discard"]);
 const GOAL_STATUS_EFFECTS = new Set(["active", "complete", "blocked"]);
@@ -595,6 +602,8 @@ export function validatePluginLayout(options = {}) {
     "scripts/dynamic-workflows.js",
     "scripts/dynamic-workflows-mcp.js",
     "scripts/lib/codex-executor.js",
+    "scripts/lib/claude-executor.js",
+    "scripts/lib/process-runner.js",
     "schemas/workflow.schema.json",
     "schemas/run-state.schema.json",
     "schemas/worker-result.schema.json",
@@ -741,6 +750,20 @@ export function validateWorkflowSpec(workflow, options = {}) {
   requireArray(workflow, "required_capabilities", errors);
   requireObject(workflow, "workspace_policy", errors);
   validateWorkspacePolicy(workflow.workspace_policy, errors);
+  if (strict) {
+    // Fail-closed: the claude sandbox has no enforceable allow-all network
+    // mechanism, so network: true would diverge from what the executor can
+    // actually enforce. Strict (plan-time) only; lenient re-reads of already
+    // planned runs are unchanged.
+    const hasClaudeTask = (Array.isArray(workflow.tasks) ? workflow.tasks : []).some(
+      (task) => resolveExecutorKind(task?.kind) === "claude",
+    );
+    if (hasClaudeTask && isPlainObject(workflow.workspace_policy) && workflow.workspace_policy.network === true) {
+      errors.push(
+        "workspace_policy.network: true is not supported for claude tasks (no enforceable allow-all network sandbox)",
+      );
+    }
+  }
   requireObject(workflow, "verification_policy", errors);
   requireArray(workflow, "stop_conditions", errors);
 
@@ -1153,8 +1176,9 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
     retryAt.delete(task.task_id);
     const attemptNumber = state.tasks[task.task_id].attempts.length + 1;
     const attemptId = `${task.task_id}-a${attemptNumber}-${crypto.randomUUID().slice(0, 8)}`;
-    const isCodex = String(task.kind).startsWith("codex");
-    const attemptDir = isCodex
+    const executorKind = resolveExecutorKind(task.kind);
+    const isSubagent = executorKind === "codex" || executorKind === "claude";
+    const attemptDir = isSubagent
       ? resolveRunArtifactPath(runDir, task.task_id, attemptId)
       : resolveRunArtifactPath(runDir, task.task_id);
     ensureDir(attemptDir);
@@ -1182,9 +1206,12 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
     });
 
     const handle = { cancel: null };
-    const runAttempt = isCodex
-      ? () => runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, startedAt, runContext)
-      : async () => runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir);
+    const runAttempt =
+      executorKind === "codex"
+        ? () => runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, startedAt, runContext)
+        : executorKind === "claude"
+          ? () => runClaudeAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, startedAt, runContext)
+          : async () => runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir);
     const promise = (async () => {
       try {
         await runAttempt();
@@ -1322,6 +1349,38 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
 
 // --- Executors -------------------------------------------------------------
 
+export function resolveExecutorKind(kind) {
+  const value = String(kind);
+  if (value.startsWith("codex")) {
+    return "codex";
+  }
+  if (value.startsWith("claude")) {
+    return "claude";
+  }
+  // Unknown kinds keep failing deterministically inside the local path.
+  return "local";
+}
+
+// Shared schema-violation quarantine: the raw worker output is saved next to
+// the attempt and the task transitions to schema_violation.
+function quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, validationErrors) {
+  writeJson(path.join(attemptDir, "rejected-result.json"), {
+    raw_message: rawMessage,
+    validation_errors: validationErrors,
+  });
+  attempt.status = "quarantined";
+  setTaskStatus(runDir, state, task.task_id, "schema_violation", {
+    attempt_id: attemptId,
+    validation_errors: validationErrors,
+  });
+  recordEvent(runDir, state, "result_submitted", {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    result_path: toRunRelative(runDir, path.join(attemptDir, "rejected-result.json")),
+    validation_errors: validationErrors,
+  });
+}
+
 async function runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext) {
   const schemaPath = path.join(runDir, WORKER_SCHEMA_FILE);
   if (!fs.existsSync(schemaPath)) {
@@ -1448,21 +1507,198 @@ async function runCodexAttempt(runDir, workflow, state, task, attemptId, attempt
   const resultPath = resolveRunArtifactPath(runDir, task.task_id, "result.json");
 
   if (resultErrors.length > 0) {
-    writeJson(path.join(attemptDir, "rejected-result.json"), {
-      raw_message: rawMessage,
-      validation_errors: resultErrors,
-    });
-    attempt.status = "quarantined";
-    setTaskStatus(runDir, state, task.task_id, "schema_violation", {
+    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, resultErrors);
+    return;
+  }
+
+  writeJson(resultPath, result);
+  state.tasks[task.task_id].result_path = toRunRelative(runDir, resultPath);
+  if (!state.artifacts.includes(toRunRelative(runDir, resultPath))) {
+    state.artifacts.push(toRunRelative(runDir, resultPath));
+  }
+  for (const artifact of result.artifacts) {
+    if (!state.artifacts.includes(artifact)) {
+      state.artifacts.push(artifact);
+    }
+  }
+  recordEvent(runDir, state, "result_submitted", {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    schema_version: SCHEMA_VERSION,
+    result_path: toRunRelative(runDir, resultPath),
+    artifact_manifest: result.artifacts,
+    token_usage: outcome.usage,
+    thread_id: outcome.threadId,
+  });
+  finishAttempt(result.status, result.status === "succeeded" ? "succeeded" : "failed", {
+    reason: result.status === "succeeded" ? "completed" : "worker_reported_failure",
+  });
+}
+
+async function runClaudeAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext) {
+  const settingsPath = path.join(runDir, CLAUDE_SETTINGS_FILE);
+  if (!fs.existsSync(settingsPath)) {
+    writeJson(settingsPath, buildClaudeSandboxSettings({ workflow }));
+  }
+  const workerEventsPath = path.join(attemptDir, "claude-events.jsonl");
+  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
+  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
+  const remainingMs = workflow.max_duration_ms - (Date.now() - runStartedAt);
+  const timeoutMs = Math.max(Math.min(task.timeout_ms ?? Infinity, remainingMs), 1000);
+  const bin = resolveClaudeBin();
+  const args = buildClaudeExecArgs({ workflow, task, settingsPath });
+
+  const attempt = state.attempts[attemptId];
+  attempt.status = "running";
+  attempt.started_at = nowIso();
+  let resultAccounted = false;
+
+  const exec = startClaudeExec({
+    bin,
+    args,
+    prompt,
+    cwd: workflow.workspace_policy.workspace_root,
+    timeoutMs,
+    onEvent: (event) => {
+      try {
+        fs.appendFileSync(workerEventsPath, `${JSON.stringify(event)}\n`, "utf8");
+      } catch {
+        // Telemetry capture is best-effort.
+      }
+      if (runContext.sealed) {
+        return;
+      }
+      if (event.type === "system" && event.subtype === "init" && typeof event.session_id === "string") {
+        attempt.thread_id = event.session_id;
+        recordEvent(runDir, state, "worker_thread_started", {
+          task_id: task.task_id,
+          attempt_id: attemptId,
+          thread_id: event.session_id,
+        });
+      }
+      if (event.type === "result" && !resultAccounted) {
+        // Single budget accounting point: the first result.usage only.
+        // assistant events also carry usage, but adding them here would double
+        // count; they stay in claude-events.jsonl as telemetry. The real CLI
+        // emits exactly one result event; the guard keeps the budget and the
+        // reported token_usage consistent if that contract ever breaks.
+        resultAccounted = true;
+        // Anthropic input_tokens excludes cache_read AND cache_creation;
+        // cache_creation is freshly processed input and must be charged to
+        // keep max_tokens enforcement comparable to codex. Only cache reads
+        // stay uncounted ("cached input is not counted").
+        const usage = event.usage ?? {};
+        const tokens =
+          (Number(usage.input_tokens) || 0) +
+          (Number(usage.cache_creation_input_tokens) || 0) +
+          (Number(usage.output_tokens) || 0) +
+          (Number(usage.reasoning_output_tokens) || 0);
+        state.budget_usage.tokens += tokens;
+        recordEvent(runDir, state, "progress", {
+          task_id: task.task_id,
+          attempt_id: attemptId,
+          token_usage: usage,
+          last_activity_at: nowIso(),
+        });
+      }
+    },
+  });
+  attempt.pid = exec.pid;
+  handle.cancel = exec.cancel;
+  recordEvent(runDir, state, "launch_started", {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    worker_id: `claude:${exec.pid ?? "unknown"}`,
+    command: [bin, ...args, "<prompt>"],
+    artifact_directory: toRunRelative(runDir, attemptDir),
+    timeout_ms: timeoutMs,
+  });
+
+  const outcome = await exec.promise;
+  if (runContext.sealed) {
+    // The orchestrator already aborted and folded this attempt.
+    return;
+  }
+  attempt.completed_at = nowIso();
+
+  // Cost is recorded only (max_cost stays advisory and unenforced); codex
+  // attempts have no cost telemetry and leave budget_usage.cost untouched.
+  if (typeof state.budget_usage.cost !== "number") {
+    state.budget_usage.cost = 0;
+  }
+  state.budget_usage.cost += outcome.totalCostUsd;
+
+  const finishAttempt = (attemptStatus, taskStatus, payload) => {
+    attempt.status = attemptStatus;
+    setTaskStatus(runDir, state, task.task_id, taskStatus, {
       attempt_id: attemptId,
-      validation_errors: resultErrors,
+      ...payload,
     });
-    recordEvent(runDir, state, "result_submitted", {
+    recordEvent(runDir, state, "worker_exited", {
       task_id: task.task_id,
       attempt_id: attemptId,
-      result_path: toRunRelative(runDir, path.join(attemptDir, "rejected-result.json")),
-      validation_errors: resultErrors,
+      exit_status: outcome.exitCode,
+      stop_reason: attemptStatus,
+      thread_id: outcome.threadId,
+      stderr_tail: outcome.stderrTail ? outcome.stderrTail.slice(-1000) : "",
     });
+  };
+
+  if (outcome.cancelled) {
+    finishAttempt("cancelled", "cancelled", { reason: "cancelled" });
+    return;
+  }
+  if (outcome.timedOut) {
+    finishAttempt("timed_out", "timed_out", { reason: "timeout", timeout_ms: timeoutMs });
+    return;
+  }
+  // The claude CLI exhausted its own structured-output retries: the worker ran
+  // but never produced schema-conforming output, so this is the
+  // schema-violation quarantine path rather than worker_failed.
+  if (outcome.resultSubtype === "error_max_structured_output_retries") {
+    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, outcome.lastAgentMessage, [
+      "claude exhausted structured output retries (error_max_structured_output_retries)",
+    ]);
+    return;
+  }
+  // Exit codes are unreliable: auth failures surface as is_error: true with
+  // exit code 0 while subtype can still read "success", so is_error and
+  // subtype are required independently of the exit code.
+  const streamSuccess =
+    outcome.exitCode === 0 &&
+    outcome.sawTurnCompleted &&
+    !outcome.isError &&
+    outcome.resultSubtype === "success" &&
+    outcome.lastAgentMessage != null;
+  if (!streamSuccess) {
+    finishAttempt("failed", "failed", {
+      reason: "worker_failed",
+      exit_code: outcome.exitCode,
+      spawn_error: outcome.spawnError,
+      saw_turn_completed: outcome.sawTurnCompleted,
+      is_error: outcome.isError,
+      result_subtype: outcome.resultSubtype,
+    });
+    return;
+  }
+
+  const rawMessage = outcome.lastAgentMessage;
+  let workerOutput;
+  try {
+    workerOutput = JSON.parse(rawMessage);
+  } catch {
+    workerOutput = null;
+  }
+  const result = workerOutput == null
+    ? null
+    : { task_id: task.task_id, attempt_id: attemptId, ...workerOutput };
+  // The CLI-side --json-schema enforcement is not trusted on its own; the
+  // worker output goes through the same validation as codex (defense in depth).
+  const resultErrors = result == null ? ["worker output was not valid JSON"] : validateWorkerResult(result);
+  const resultPath = resolveRunArtifactPath(runDir, task.task_id, "result.json");
+
+  if (resultErrors.length > 0) {
+    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, resultErrors);
     return;
   }
 
@@ -1715,6 +1951,40 @@ function buildDefaultWorkflowSpec({ objective, workspace, runId, workflowId, cre
   };
 }
 
+// Approval-summary view of the enforced sandbox. The per-executor breakdown is
+// emitted only when the workflow contains a claude-kind task: codex-only
+// summaries must stay byte-identical to the pre-claude format.
+function buildExecutionSandboxSummary(workflow, policy) {
+  const workspaceWrite = Array.isArray(policy.write_scope) && policy.write_scope.includes("workspace");
+  const summary = {
+    mode: workspaceWrite ? "workspace-write" : "read-only",
+    write_scope: policy.write_scope,
+    network_access: workspaceWrite && policy.network === true,
+    unsupported_permissions_rejected: ["shell", "mcp_write"],
+  };
+  const tasks = Array.isArray(workflow.tasks) ? workflow.tasks : [];
+  const hasClaudeTask = tasks.some((task) => resolveExecutorKind(task?.kind) === "claude");
+  if (!hasClaudeTask) {
+    return summary;
+  }
+  const hasCodexTask = tasks.some((task) => resolveExecutorKind(task?.kind) === "codex");
+  const executors = {};
+  if (hasCodexTask) {
+    executors.codex = { sandbox: workspaceWrite ? "workspace-write" : "read-only" };
+  }
+  executors.claude = {
+    permission_mode: workspaceWrite ? "dontAsk" : "default",
+    tools: workspaceWrite ? "write set" : "read-only set",
+    os_sandbox: workspaceWrite
+      ? `settings (allow write ${policy.workspace_root} / no network)`
+      : `settings (deny write ${policy.workspace_root} / no network)`,
+    setting_sources: "none (all ambient excluded)",
+    customizations: "disabled (--safe-mode)",
+  };
+  summary.executors = executors;
+  return summary;
+}
+
 function buildInitialRunState({ workflow, goalId, createdAt, specHash }) {
   const tasks = {};
   for (const task of workflow.tasks) {
@@ -1782,15 +2052,7 @@ function buildInitialRunState({ workflow, goalId, createdAt, specHash }) {
         max_agents: workflow.max_agents,
         max_concurrency: workflow.max_concurrency,
         requested_capabilities: workflow.required_capabilities,
-        execution_sandbox: {
-          mode: Array.isArray(policy.write_scope) && policy.write_scope.includes("workspace")
-            ? "workspace-write"
-            : "read-only",
-          write_scope: policy.write_scope,
-          network_access:
-            Array.isArray(policy.write_scope) && policy.write_scope.includes("workspace") && policy.network === true,
-          unsupported_permissions_rejected: ["shell", "mcp_write"],
-        },
+        execution_sandbox: buildExecutionSandboxSummary(workflow, policy),
         budget: {
           max_tokens: workflow.max_tokens,
           max_duration_ms: workflow.max_duration_ms,
@@ -2286,8 +2548,10 @@ function validateWorkspacePolicy(policy, errors) {
     errors.push("workspace_policy.network must be a boolean");
   }
   const writeScope = Array.isArray(policy.write_scope) ? policy.write_scope : [];
+  // Applies to claude tasks too: claude could technically do read-only+network,
+  // but per-executor policy vocabularies would make the approval summary ambiguous (design decision).
   if (policy.network === true && !writeScope.includes("workspace")) {
-    errors.push("workspace_policy.network requires write_scope to include workspace because Codex network access is tied to workspace-write sandboxing");
+    errors.push("workspace_policy.network requires write_scope to include workspace (runner policy)");
   }
   if (policy.shell === true) {
     errors.push("workspace_policy.shell is not supported by the runner and cannot be requested");

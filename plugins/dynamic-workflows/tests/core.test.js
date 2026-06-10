@@ -1275,3 +1275,403 @@ function writeMcpMessage(stdin, message, options = {}) {
   }
   stdin.write(`Content-Length: ${Buffer.byteLength(json, "utf8")}${delimiter}${json}`);
 }
+
+// --- Claude executor (claude-* task kinds) ----------------------------------
+// Case numbers refer to section 6 (テスト計画) of
+// docs/local/dynamic-workflows-claude-worker-dispatch-design.md.
+// Case 9 (process-runner extraction keeps codex behavior) has no dedicated
+// test: the pre-existing codex suite above passing unchanged is the guarantee.
+// Cancellation (case 6's cancel half) also rides the shared process-runner
+// escalation already pinned by the codex cancelWorkflow test.
+
+import {
+  buildClaudeExecArgs,
+  buildClaudeSandboxSettings,
+  resolveClaudeBin,
+} from "../scripts/lib/claude-executor.js";
+import { WORKER_OUTPUT_SCHEMA } from "../scripts/lib/codex-executor.js";
+
+const fakeClaudeBin = path.join(pluginRoot, "tests", "fixtures", "fake-claude.js");
+
+function singleClaudeTaskSpec(taskOverrides = {}, specOverrides = {}) {
+  return codexSpec({
+    objective: "Exercise the claude executor with a fake binary",
+    phases: [{ phase_id: "p1", tasks: ["t1"] }],
+    tasks: [
+      {
+        task_id: "t1",
+        phase_id: "p1",
+        kind: "claude_agent",
+        role: "tester",
+        prompt_template: "Run task one.",
+        ...taskOverrides,
+      },
+    ],
+    ...specOverrides,
+  });
+}
+
+function mixedExecutorSpec(specOverrides = {}) {
+  return codexSpec({
+    objective: "Route each task kind to its own executor",
+    phases: [{ phase_id: "p1", tasks: ["cx", "cl"] }],
+    tasks: [
+      { task_id: "cx", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "codex task" },
+      { task_id: "cl", phase_id: "p1", kind: "claude_agent", role: "w", prompt_template: "claude task" },
+    ],
+    ...specOverrides,
+  });
+}
+
+function flagValueIn(args, flag) {
+  const index = args.indexOf(flag);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+// Case 1: dispatch routing.
+test("scheduler dispatches codex and claude tasks to their own executors", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: mixedExecutorSpec() });
+
+  const completed = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_CLAUDE_BIN: fakeClaudeBin },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.tasks.cx.status, "succeeded");
+  assert.equal(completed.tasks.cl.status, "succeeded");
+
+  const state = readRunState(planned.run_dir);
+  assert.match(state.attempts[state.tasks.cx.attempts[0]].thread_id, /^fake-thread-/);
+  assert.match(state.attempts[state.tasks.cl.attempts[0]].thread_id, /^fake-claude-session-/);
+});
+
+// Case 2: success path (result.json, session_id as thread id, tokens and cost).
+test("claude executor runs a worker through the fake claude binary", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const completed = await withEnvAsync({ CCDW_CLAUDE_BIN: fakeClaudeBin }, () =>
+    runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.tasks.t1.status, "succeeded");
+  assert.equal(completed.budget_usage.tokens, 150);
+  assert.equal(completed.budget_usage.cost, 0.0123);
+
+  const resultPath = path.join(planned.run_dir, "artifacts", "t1", "result.json");
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  assert.equal(result.task_id, "t1");
+  assert.equal(result.status, "succeeded");
+
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.match(state.attempts[attemptId].thread_id, /^fake-claude-session-/);
+  assert.ok(fs.existsSync(path.join(planned.run_dir, "claude-settings.json")));
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  assert.ok(fs.existsSync(path.join(attemptDir, "claude-events.jsonl")));
+
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  const launch = events.find((event) => event.type === "launch_started");
+  assert.match(launch.payload.worker_id, /^claude:/);
+});
+
+// Case 3: exit 0 + is_error:true must fail as worker_failed (verified trap).
+test("claude result with exit 0 and is_error true fails the task as worker_failed", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_IS_ERROR: "1" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "failed");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "failed");
+
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  const failure = events.find(
+    (event) =>
+      event.type === "task_status_changed" &&
+      event.payload.task_id === "t1" &&
+      event.payload.status === "failed",
+  );
+  assert.equal(failure.payload.reason, "worker_failed");
+});
+
+// Case 4: schema-violating structured_output -> quarantine + schema_violation.
+test("schema-violating claude structured output is quarantined as a schema violation", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_RESULT_STATUS: "not-a-valid-status" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "schema_violation");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "quarantined");
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  assert.ok(fs.existsSync(path.join(attemptDir, "rejected-result.json")));
+});
+
+// Case 4 (fallback half): result without structured_output falls back to the
+// human text, which is not JSON -> same quarantine path as codex invalid JSON.
+test("claude result without structured output is quarantined as a schema violation", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_INVALID_JSON: "1" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "schema_violation");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "quarantined");
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  assert.ok(fs.existsSync(path.join(attemptDir, "rejected-result.json")));
+});
+
+// Case 5: error_max_structured_output_retries -> quarantine path.
+test("claude structured output retry exhaustion is quarantined as a schema violation", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_SCHEMA_RETRY_EXHAUSTED: "1" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "schema_violation");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "quarantined");
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  assert.ok(fs.existsSync(path.join(attemptDir, "rejected-result.json")));
+});
+
+// Case 6: per-task timeout applies to claude workers (mirror of the codex test).
+test("worker timeout kills the claude worker and fails the run fail-closed", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: singleClaudeTaskSpec({ timeout_ms: 300 }),
+  });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_SLEEP_MS: "30000" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "timed_out");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "timed_out");
+});
+
+// Case 7: retry policy relaunches claude workers (fail-marker first attempt).
+test("retry policy relaunches a failed claude worker", async () => {
+  const workspace = makeTempWorkspace();
+  const marker = path.join(workspace, "fail-once.marker");
+  const planned = planWorkflow({
+    workspace,
+    spec: singleClaudeTaskSpec({
+      retry_policy: { retryable: true, max_attempts: 2, backoff_ms: 10 },
+    }),
+  });
+
+  const result = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_FAIL_MARKER: marker },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.tasks.t1.status, "succeeded");
+  assert.equal(result.tasks.t1.attempts.length, 2);
+});
+
+// Case 8: CCDW_CLAUDE_BIN resolution. The integration tests above also prove
+// the override end-to-end (they all select the fake binary through it).
+test("resolveClaudeBin honors CCDW_CLAUDE_BIN", () => {
+  assert.equal(resolveClaudeBin({ CCDW_CLAUDE_BIN: "/tmp/claude-test-bin" }), "/tmp/claude-test-bin");
+  assert.equal(resolveClaudeBin({}), "claude");
+  assert.equal(resolveClaudeBin({ CCDW_CLAUDE_BIN: "   " }), "claude");
+});
+
+// Case 10: approval summary shows claude executor enforcement per executor.
+test("approval summary surfaces claude executor enforcement only when claude tasks exist", () => {
+  const workspace = makeTempWorkspace();
+
+  const claudePlan = planWorkflow({ workspace, runId: "claude-summary", spec: singleClaudeTaskSpec() });
+  const claudeSandbox = claudePlan.approval.summary.execution_sandbox;
+  const claudeEntry = claudeSandbox.executors.claude;
+  assert.equal(claudeEntry.permission_mode, "default");
+  assert.equal(claudeEntry.setting_sources, "none (all ambient excluded)");
+  assert.equal(claudeEntry.customizations, "disabled (--safe-mode)");
+  assert.ok(typeof claudeEntry.tools === "string" && claudeEntry.tools.length > 0);
+  assert.ok(typeof claudeEntry.os_sandbox === "string" && claudeEntry.os_sandbox.length > 0);
+  assert.equal(claudeSandbox.executors.codex, undefined);
+
+  const mixedPlan = planWorkflow({ workspace, runId: "mixed-summary", spec: mixedExecutorSpec() });
+  const mixedExecutors = mixedPlan.approval.summary.execution_sandbox.executors;
+  assert.deepEqual(Object.keys(mixedExecutors).sort(), ["claude", "codex"]);
+  assert.ok(mixedExecutors.codex);
+
+  const codexPlan = planWorkflow({ workspace, runId: "codex-summary", spec: singleCodexTaskSpec() });
+  assert.equal(codexPlan.approval.summary.execution_sandbox.executors, undefined);
+});
+
+// Case 11: budget is added once from the result event; the assistant event
+// carries the same usage as telemetry and must not be double-counted.
+test("claude budget counts result usage once despite assistant usage telemetry", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec() });
+
+  const completed = await withEnvAsync(
+    {
+      CCDW_CLAUDE_BIN: fakeClaudeBin,
+      CCDW_FAKE_TOKENS: "70",
+      CCDW_FAKE_TOTAL_COST: "0.25",
+      // Anthropic input_tokens excludes cache_creation; the runner must charge
+      // cache_creation as fresh input (only cache READS stay uncounted).
+      CCDW_FAKE_CACHE_CREATION: "1000",
+    },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.budget_usage.tokens, 1170);
+  assert.equal(completed.budget_usage.cost, 0.25);
+
+  const state = readRunState(planned.run_dir);
+  const attemptDir = path.join(planned.run_dir, state.attempts[state.tasks.t1.attempts[0]].artifact_dir);
+  const workerEvents = fs
+    .readFileSync(path.join(attemptDir, "claude-events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.ok(
+    workerEvents.some(
+      (event) => event.type === "assistant" && event.message?.usage?.output_tokens === 70,
+    ),
+    "expected the fake worker to stream assistant usage telemetry",
+  );
+});
+
+// Case 12: generated sandbox settings are fail-closed in both modes. Unknown
+// --settings keys are silently ignored by the CLI, so key-name typos can only
+// be caught here.
+test("buildClaudeSandboxSettings emits fail-closed sandbox settings in both modes", () => {
+  const workspaceRoot = "/tmp/dw-claude-workspace";
+
+  const readOnly = buildClaudeSandboxSettings({
+    workflow: { workspace_policy: { workspace_root: workspaceRoot, write_scope: ["run_dir"], network: false } },
+  });
+  assert.equal(readOnly.sandbox.enabled, true);
+  assert.equal(readOnly.sandbox.failIfUnavailable, true);
+  assert.equal(readOnly.sandbox.allowUnsandboxedCommands, false);
+  assert.deepEqual(readOnly.sandbox.filesystem.denyWrite, [workspaceRoot]);
+  assert.deepEqual(readOnly.sandbox.network.allowedDomains, []);
+
+  const workspaceWrite = buildClaudeSandboxSettings({
+    workflow: { workspace_policy: { workspace_root: workspaceRoot, write_scope: ["workspace"], network: false } },
+  });
+  assert.equal(workspaceWrite.sandbox.enabled, true);
+  assert.equal(workspaceWrite.sandbox.failIfUnavailable, true);
+  assert.equal(workspaceWrite.sandbox.allowUnsandboxedCommands, false);
+  assert.deepEqual(workspaceWrite.sandbox.filesystem.allowWrite, [workspaceRoot]);
+  assert.deepEqual(workspaceWrite.sandbox.network.allowedDomains, []);
+
+  // network:true still yields an empty allowlist: there is no enforceable
+  // allow-all network sandbox, and plan-time validation rejects the combination.
+  for (const writeScope of [["run_dir"], ["workspace"]]) {
+    const networkTrue = buildClaudeSandboxSettings({
+      workflow: { workspace_policy: { workspace_root: workspaceRoot, write_scope: writeScope, network: true } },
+    });
+    assert.deepEqual(networkTrue.sandbox.network.allowedDomains, []);
+  }
+});
+
+// Case 12 (argv half): mode-specific args stay fail-closed and never widen.
+test("buildClaudeExecArgs builds mode-specific fail-closed argv", () => {
+  const settingsPath = "/tmp/dw-claude-run/claude-settings.json";
+  const workspaceRoot = "/tmp/dw-claude-workspace";
+
+  const readOnlyArgs = buildClaudeExecArgs({
+    workflow: { workspace_policy: { workspace_root: workspaceRoot, write_scope: ["run_dir"], network: false } },
+    task: { task_id: "t1" },
+    settingsPath,
+  });
+  assert.equal(flagValueIn(readOnlyArgs, "--setting-sources"), "");
+  assert.equal(flagValueIn(readOnlyArgs, "--tools"), "Read,Glob,Grep,Bash");
+  assert.equal(flagValueIn(readOnlyArgs, "--allowedTools"), "Read,Glob,Grep,Bash");
+  assert.equal(flagValueIn(readOnlyArgs, "--disallowedTools"), "Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__*");
+  assert.equal(flagValueIn(readOnlyArgs, "--permission-mode"), "default");
+  assert.equal(flagValueIn(readOnlyArgs, "--settings"), settingsPath);
+  assert.equal(String(flagValueIn(readOnlyArgs, "--max-turns")), "50");
+  assert.deepEqual(JSON.parse(flagValueIn(readOnlyArgs, "--json-schema")), WORKER_OUTPUT_SCHEMA);
+  assert.ok(readOnlyArgs.includes("--safe-mode"));
+  assert.ok(readOnlyArgs.includes("--no-session-persistence"));
+  assert.ok(!readOnlyArgs.includes("--bare"));
+  assert.ok(!readOnlyArgs.includes("--model"));
+
+  const writeArgs = buildClaudeExecArgs({
+    workflow: { workspace_policy: { workspace_root: workspaceRoot, write_scope: ["workspace"], network: false } },
+    task: { task_id: "t1", model: "fake-model-x" },
+    settingsPath,
+  });
+  assert.equal(flagValueIn(writeArgs, "--tools"), "Edit,Write,Read,Glob,Grep,Bash");
+  assert.equal(flagValueIn(writeArgs, "--allowedTools"), "Edit,Write,Read,Glob,Grep,Bash");
+  assert.equal(flagValueIn(writeArgs, "--disallowedTools"), "NotebookEdit,WebFetch,WebSearch,mcp__*");
+  assert.equal(flagValueIn(writeArgs, "--permission-mode"), "dontAsk");
+  assert.equal(flagValueIn(writeArgs, "--model"), "fake-model-x");
+  assert.ok(writeArgs.includes("--safe-mode"));
+  assert.ok(writeArgs.includes("--no-session-persistence"));
+  assert.ok(!writeArgs.includes("--bare"));
+});
+
+// Case 13: plan-time rejection of claude tasks with network:true; the codex
+// equivalent stays valid (the general constraint still requires
+// workspace-write, which both specs satisfy here).
+test("plan rejects claude tasks that request workspace network access", () => {
+  const workspace = makeTempWorkspace();
+
+  const claudeResult = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleClaudeTaskSpec(
+      {},
+      { workspace_policy: { write_scope: ["workspace"], network: true } },
+    ),
+  });
+  assert.equal(claudeResult.valid, false);
+  assert.ok(
+    claudeResult.errors.some((message) =>
+      message.includes("workspace_policy.network: true is not supported for claude tasks"),
+    ),
+  );
+
+  const codexResult = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleCodexTaskSpec(
+      {},
+      { workspace_policy: { write_scope: ["workspace"], network: true } },
+    ),
+  });
+  assert.equal(codexResult.valid, true);
+  assert.deepEqual(codexResult.errors, []);
+});

@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { startNdjsonProcess } from "./process-runner.js";
 
 // Strict-mode schema for the model's final message: codex exec --output-schema
 // requires additionalProperties:false and every property listed in required.
@@ -126,18 +126,6 @@ export function buildWorkerPrompt({ workflow, task, runDir, inputPaths }) {
 // alone (SIGINT can exit 0): callers must combine exitCode === 0 with
 // sawTurnCompleted and a non-empty final message.
 export function startCodexExec({ bin, args, prompt, cwd, timeoutMs, onEvent }) {
-  const child = spawn(bin, [...args, prompt], {
-    cwd,
-    // stdin must be closed: an open-but-unwritten stdin pipe hangs codex exec.
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  });
-
-  let settled = false;
-  let timedOut = false;
-  let cancelled = false;
-  let stdoutBuffer = "";
-  let stderrTail = "";
   let threadId = null;
   let sawTurnCompleted = false;
   let lastAgentMessage = null;
@@ -147,126 +135,50 @@ export function startCodexExec({ bin, args, prompt, cwd, timeoutMs, onEvent }) {
     output_tokens: 0,
     reasoning_output_tokens: 0,
   };
-  const escalationTimers = [];
 
-  const killGroup = (signal) => {
-    try {
-      if (process.platform === "win32" || child.pid == null) {
-        child.kill(signal);
-      } else {
-        process.kill(-child.pid, signal);
+  const handle = startNdjsonProcess({
+    bin,
+    args,
+    prompt,
+    cwd,
+    timeoutMs,
+    onEvent(event) {
+      if (event.type === "thread.started" && typeof event.thread_id === "string") {
+        threadId = event.thread_id;
       }
-    } catch {
-      // Process group already gone.
-    }
-  };
-
-  const escalate = () => {
-    killGroup("SIGINT");
-    for (const [delay, signal] of [[3000, "SIGTERM"], [6000, "SIGKILL"]]) {
-      const timer = setTimeout(() => killGroup(signal), delay);
-      timer.unref?.();
-      escalationTimers.push(timer);
-    }
-  };
-
-  let timeoutTimer = null;
-  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      escalate();
-    }, timeoutMs);
-    timeoutTimer.unref?.();
-  }
-
-  const handleLine = (line) => {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      return;
-    }
-    let event;
-    try {
-      event = JSON.parse(trimmed);
-    } catch {
-      return;
-    }
-    if (event.type === "thread.started" && typeof event.thread_id === "string") {
-      threadId = event.thread_id;
-    }
-    if (event.type === "turn.completed") {
-      sawTurnCompleted = true;
-      const turnUsage = event.usage ?? {};
-      for (const key of Object.keys(usage)) {
-        usage[key] += Number(turnUsage[key]) || 0;
+      if (event.type === "turn.completed") {
+        sawTurnCompleted = true;
+        const turnUsage = event.usage ?? {};
+        for (const key of Object.keys(usage)) {
+          usage[key] += Number(turnUsage[key]) || 0;
+        }
       }
-    }
-    if (
-      event.type === "item.completed" &&
-      event.item?.type === "agent_message" &&
-      typeof event.item.text === "string"
-    ) {
-      lastAgentMessage = event.item.text;
-    }
-    try {
+      if (
+        event.type === "item.completed" &&
+        event.item?.type === "agent_message" &&
+        typeof event.item.text === "string"
+      ) {
+        lastAgentMessage = event.item.text;
+      }
       onEvent?.(event);
-    } catch {
-      // Observers must not break worker accounting.
-    }
-  };
-
-  child.stdout.on("data", (chunk) => {
-    stdoutBuffer += chunk.toString("utf8");
-    let newlineIndex = stdoutBuffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      handleLine(stdoutBuffer.slice(0, newlineIndex));
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-      newlineIndex = stdoutBuffer.indexOf("\n");
-    }
-  });
-  child.stderr.on("data", (chunk) => {
-    stderrTail = `${stderrTail}${chunk.toString("utf8")}`.slice(-4000);
-  });
-
-  const promise = new Promise((resolve) => {
-    const finalize = (exitCode, spawnError) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-      for (const timer of escalationTimers) {
-        clearTimeout(timer);
-      }
-      if (stdoutBuffer) {
-        handleLine(stdoutBuffer);
-        stdoutBuffer = "";
-      }
-      resolve({
-        exitCode,
-        spawnError: spawnError?.message ?? null,
-        timedOut,
-        cancelled,
-        threadId,
-        sawTurnCompleted,
-        lastAgentMessage,
-        usage,
-        stderrTail,
-        pid: child.pid ?? null,
-      });
-    };
-    child.on("error", (error) => finalize(null, error));
-    child.on("close", (code) => finalize(code, null));
+    },
   });
 
   return {
-    pid: child.pid ?? null,
-    promise,
-    cancel() {
-      cancelled = true;
-      escalate();
-    },
+    pid: handle.pid,
+    promise: handle.promise.then(({ exitCode, spawnError, timedOut, cancelled, stderrTail, pid }) => ({
+      exitCode,
+      spawnError,
+      timedOut,
+      cancelled,
+      threadId,
+      sawTurnCompleted,
+      lastAgentMessage,
+      usage,
+      stderrTail,
+      pid,
+    })),
+    cancel: handle.cancel,
   };
 }
 

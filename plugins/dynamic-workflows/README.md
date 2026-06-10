@@ -1,7 +1,8 @@
 # Dynamic Workflows
 
 Dynamic Workflows is a local Codex plugin that runs a caller-authored
-declarative workflow as real `codex exec` subagents: the planning agent writes
+declarative workflow as real `codex exec` or `claude -p` subagents: the
+planning agent writes
 a WorkflowSpec JSON, the runner validates it, schedules tasks in parallel up to
 `max_concurrency`, enforces token/duration/agent budgets fail-closed, and
 persists every step for approval, resume, cancellation, and audit.
@@ -22,15 +23,32 @@ artifact paths before writing, so caller-authored specs cannot escape the run's
 Tasks with `kind` starting with `codex` execute as `codex exec` subprocesses
 (`--json` event stream, `--output-schema`-enforced structured results,
 sandbox mapped from `workspace_policy`, thread ids recorded for audit/resume).
-`local_*` kinds run a deterministic no-LLM executor used by the default
-template and the test suite. Set `CCDW_CODEX_BIN` to override the codex binary.
+Set `CCDW_CODEX_BIN` to override the codex binary.
 
-The enforced Codex sandbox is `read-only` unless
-`workspace_policy.write_scope` includes `"workspace"`, in which case it becomes
-`workspace-write`; network access is only passed through for that
-workspace-write mode. The runner rejects `workspace_policy.shell:true` and
-`workspace_policy.mcp_write:true` because those permissions are not enforced by
-the current Codex invocation.
+Tasks with `kind` starting with `claude` (recommended: `claude_agent`) execute
+as Claude Code `claude -p` subprocesses (`stream-json` event stream, the same
+`--json-schema`-enforced structured results, OS sandbox via a generated
+fail-closed `--settings` file, ambient settings excluded with
+`--setting-sources ""`, customizations disabled with `--safe-mode`, built-in
+tools restricted via `--tools`/`--allowedTools`/`--disallowedTools`, no
+session persistence, session ids recorded for audit). Set `CCDW_CLAUDE_BIN`
+to override the claude binary; the minimum supported CLI is 2.1.x. Because
+ambient settings are excluded, `apiKeyHelper`-based auth is not available to
+workers (export `ANTHROPIC_API_KEY` instead) and the user-level `model`
+setting does not apply (use the task-level `model` field).
+
+`local_*` kinds run a deterministic no-LLM executor used by the default
+template and the test suite.
+
+The enforced sandbox is `read-only` unless `workspace_policy.write_scope`
+includes `"workspace"`, in which case it becomes `workspace-write` (claude
+filesystem writes are limited to the workspace root); network access is only
+passed through for codex tasks in that workspace-write mode.
+`workspace_policy.network:true` is rejected at plan time for workflows
+containing claude tasks because the claude sandbox has no enforceable
+allow-all network mechanism. The runner rejects `workspace_policy.shell:true`
+and `workspace_policy.mcp_write:true` because those permissions are not
+enforced by the current worker invocations.
 
 Plan-time validation is strict: `entry_condition` / `condition` accept only
 `always` (with empty `depends_on`) or `dependencies_succeeded`,
@@ -44,7 +62,9 @@ with the previous, lenient rules.
 
 Token accounting is approximate: `cached_input_tokens` are not counted toward
 `max_tokens`, and multi-turn workers re-count their input tokens each turn, so
-budget with margin instead of sizing `max_tokens` exactly.
+budget with margin instead of sizing `max_tokens` exactly. claude usage is
+counted once per attempt from the final result event; mid-attempt overruns are
+bounded by the per-task `timeout_ms` and `--max-turns`.
 
 The plugin intentionally does not hook or replace Codex's built-in `/goal`
 command. Invoke the bundled skill or call the runner directly.

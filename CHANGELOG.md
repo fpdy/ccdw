@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.4.0 - 2026-06-11
+
+### Added
+
+- Claude Code worker dispatch: task `kind` values starting with `claude`
+  (recommended: `claude_agent`) now execute as `claude -p` subagents alongside
+  the existing `codex*` and `local_*` families. Workers run with
+  `--output-format stream-json`, structured results enforced via `--json-schema`
+  (the shared `WORKER_OUTPUT_SCHEMA`, still double-validated and quarantined by
+  the runner), a generated fail-closed sandbox settings file
+  (`failIfUnavailable: true`, `allowUnsandboxedCommands: false`,
+  `denyWrite`/`allowWrite` derived from `workspace_policy.write_scope`, empty
+  network allowlist), all ambient user/project/local settings excluded via
+  `--setting-sources ""`, customizations disabled via `--safe-mode`, built-in
+  tools restricted per mode (`--tools` + `--allowedTools` + `--disallowedTools`
+  incl. `mcp__*`), `--permission-mode default|dontAsk`, and
+  `--no-session-persistence`. Session ids are recorded for audit,
+  `total_cost_usd` accumulates into `budget_usage.cost` (advisory), and budget
+  tokens are charged once per attempt from the final `result` event —
+  including `cache_creation_input_tokens` (only cache reads stay uncounted).
+  Success requires `is_error: false` in addition to exit code 0 (auth failures
+  surface as `is_error: true` with exit 0 and subtype "success"). Set
+  `CCDW_CLAUDE_BIN` to override the binary; requires claude CLI 2.1.x or later.
+- Plan-time strict validation rejects `workspace_policy.network: true` for
+  workflows containing claude tasks: the claude sandbox has no enforceable
+  allow-all network mechanism (per-domain allowlists only), and the approval
+  summary must not overstate reachability. Codex-only workflows are unchanged.
+  Stored runs are still re-read leniently.
+- The approval summary's `execution_sandbox` gains a per-executor `executors`
+  block when claude tasks are present (permission mode, tool set, OS sandbox,
+  `setting_sources: "none (all ambient excluded)"`, `--safe-mode`); codex-only
+  summaries are byte-identical to v0.3.1.
+- `tests/fixtures/fake-claude.js` test double reproducing the claude
+  stream-json contract (incl. the exit-0/`is_error` trap, structured-output
+  retry exhaustion, and cache-creation token accounting) plus 14 new tests.
+
+### Changed
+
+- Subprocess plumbing (spawn, process-group kill escalation, timeout, NDJSON
+  line framing, stderr tail) is extracted from the codex executor into the
+  shared `scripts/lib/process-runner.js`; both executors interpret only their
+  own event types. Behavior-preserving, with one hardening: `cancel()` after
+  the worker already exited is now a no-op instead of arming stray
+  SIGTERM/SIGKILL escalation timers against a possibly recycled process group.
+- The codex-specific plan error for network-without-workspace-write is
+  generalized to "workspace_policy.network requires write_scope to include
+  workspace (runner policy)" (same behavior, executor-neutral wording).
+
+### Documentation
+
+- Root READMEs, the plugin README, SKILL.md, and the MCP `plan` tool
+  description now describe the three executor families, `CCDW_CLAUDE_BIN`, the
+  claude network rejection, and the once-per-attempt claude token accounting.
+  Operational note: because ambient settings are excluded, `apiKeyHelper`-based
+  auth does not reach claude workers (export `ANTHROPIC_API_KEY` instead), and
+  the user-level `model` setting does not apply (set task-level `model`).
+
 ## v0.3.1 - 2026-06-10
 
 ### Fixed

@@ -1,13 +1,13 @@
 ---
 name: dynamic-workflows
-description: Decompose a large task into a declarative workflow and run it as parallel codex exec subagents with approval gates, budgets, progress polling, resume, and cancellation. Use for audits, migrations, research, and other work with 5+ independent subtasks that need fan-out and verification. This plugin does not hook or replace the built-in /goal command.
+description: Decompose a large task into a declarative workflow and run it as parallel codex exec or claude -p subagents with approval gates, budgets, progress polling, resume, and cancellation. Use for audits, migrations, research, and other work with 5+ independent subtasks that need fan-out and verification. This plugin does not hook or replace the built-in /goal command.
 ---
 
 # Dynamic Workflows
 
 You are the planner. The runner validates your plan, schedules tasks as real
-`codex exec` subagents (or deterministic local tasks), enforces budgets
-fail-closed, and persists everything for resume and audit.
+`codex exec` or `claude -p` subagents (or deterministic local tasks), enforces
+budgets fail-closed, and persists everything for resume and audit.
 
 ## When to use
 
@@ -28,6 +28,13 @@ node <plugin-root>/scripts/dynamic-workflows.js <command> --json
 If unsure of the plugin root, locate this skill file's directory and go two
 levels up (`skills/dynamic-workflows` -> plugin root). The same operations are
 available as MCP tools (`dynamic_workflows_*`).
+
+codex tasks require the `codex` CLI on PATH; claude tasks require the `claude`
+CLI (2.1.x or later) on PATH. claude workers run with all ambient settings
+excluded (`--setting-sources ""`), so `apiKeyHelper`-based auth does not reach
+them — such environments must export `ANTHROPIC_API_KEY` to the orchestrator's
+environment — and the user-level `model` setting does not apply either, so set
+a task-level `model` if you need a specific one.
 
 ## Planning the spec
 
@@ -73,12 +80,14 @@ Rules for good specs:
 - `phase_id` and `task_id` must match
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; never use slashes, `..`, spaces, or
   user-supplied path fragments in ids.
-- Tasks with `kind` starting with `codex` run as real subagents; `local_*`
-  kinds are deterministic no-LLM steps. Workers run read-only unless
-  `workspace_policy.write_scope` includes `"workspace"`.
+- Tasks with `kind` starting with `codex` run as `codex exec` subagents;
+  kinds starting with `claude` (e.g. `claude_agent`) run as `claude -p`
+  subagents; `local_*` kinds are deterministic no-LLM steps. Workers run
+  read-only unless `workspace_policy.write_scope` includes `"workspace"`.
 - The runner rejects `workspace_policy.shell:true` and `mcp_write:true`; the
-  approval summary reports the actually enforced Codex sandbox and network
-  access instead.
+  approval summary reports the actually enforced worker sandbox and network
+  access instead. `workspace_policy.network:true` is rejected at plan time for
+  workflows containing claude tasks.
 - Expand fan-out yourself at plan time (one task per file group/claim/area);
   `fanout_source` must stay null because the runner never expands it.
 - Conditions must match what the engine actually does: `entry_condition` /
@@ -90,11 +99,13 @@ Rules for good specs:
   Explicit values must be `"objective"`, `"accepted_worker_results"`, a
   non-empty path string, or a non-empty array of non-empty path strings; paths
   resolve relative to the run directory.
-- Keep `max_concurrency` low (2-4); each worker is a full Codex session.
+- Keep `max_concurrency` low (2-4); each worker is a full codex or claude
+  session.
 - Set per-task `timeout_ms` and a run-level `max_tokens`; the runner enforces
   both fail-closed. Token accounting is approximate: cached input tokens are
   not counted and multi-turn workers re-count input per turn, so leave margin
-  in `max_tokens` rather than sizing it exactly.
+  in `max_tokens` rather than sizing it exactly. The same margin advice
+  applies to claude tasks (their usage is counted once per attempt).
 - `max_cost`, `max_retries`, `max_no_progress_iterations`,
   `verification_required`, and `verification_policy` are advisory: they are
   recorded and shown in the approval summary's `advisory_fields`, but the

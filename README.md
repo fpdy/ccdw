@@ -8,7 +8,7 @@ This repository currently hosts local Codex agent assets and a Dynamic
 Workflows plugin implementation.
 
 Dynamic Workflows turns a task plan into a local declarative workflow run
-executed by real `codex exec` subagents. The calling agent authors a
+executed by real `codex exec` or `claude -p` subagents. The calling agent authors a
 WorkflowSpec JSON; the runner validates it, schedules tasks in parallel with
 fail-closed budgets, and writes a workflow specification, runtime state, an
 append-only event log, and task artifacts so the workflow can be approved,
@@ -50,7 +50,7 @@ Each run directory contains:
 - `events.ndjson`: an append-only protocol and audit event log.
 - `artifacts/`: structured worker results and per-attempt raw output.
 
-Two executors are built in:
+Three executors are built in:
 
 - **codex executor**: tasks whose `kind` starts with `codex` run as
   `codex exec` subprocesses with a JSONL event stream, schema-enforced
@@ -58,8 +58,16 @@ Two executors are built in:
   the spec grants workspace write), per-task timeouts with process-group
   kill escalation, and token usage accounting into the run budget. Set
   `CCDW_CODEX_BIN` to override the binary.
+- **claude executor**: tasks whose `kind` starts with `claude` run as
+  Claude Code `claude -p` subprocesses with a stream-json event stream, the
+  same schema-enforced structured output, an OS sandbox derived from
+  `workspace_policy` (read-only unless the spec grants workspace write),
+  ambient settings and customizations excluded, and token usage accounting
+  into the run budget. Set `CCDW_CLAUDE_BIN` to override the binary.
+  `workspace_policy.network:true` is rejected at plan time for workflows
+  containing claude tasks.
 - **local executor**: deterministic `local_*` task kinds used by the default
-  template and the test suite; no Codex sessions are spawned.
+  template and the test suite; no LLM sessions are spawned.
 
 The scheduler is a ready-queue over the phase/task DAG: tasks run as soon as
 their dependencies succeed, up to `max_concurrency`, and the run fails closed
@@ -69,21 +77,23 @@ Workflow `phase_id` and `task_id` values must match
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; artifact writes are also checked so task
 identifiers cannot escape the run's `artifacts/` directory.
 
-The approval summary reports the actually enforced Codex sandbox. Workers run
+The approval summary reports the actually enforced worker sandbox. Workers run
 with a read-only sandbox unless `workspace_policy.write_scope` includes
-`"workspace"`; network access is only supported in that workspace-write mode.
-The runner rejects `workspace_policy.shell:true` and
+`"workspace"`; network access is only supported for codex tasks in that
+workspace-write mode. The runner rejects `workspace_policy.shell:true` and
 `workspace_policy.mcp_write:true` because those permissions are not enforced by
-the current Codex invocation.
+the current worker invocations.
 
 ## Requirements
 
 - Node.js with ESM support.
 - npm, for running the plugin test scripts.
 - The `codex` CLI on PATH (only for workflows that use codex tasks).
+- The `claude` CLI, 2.1.x or later, on PATH (only for workflows that use
+  claude tasks).
 
 No package installation is required for the test suite; tests exercise the
-codex executor through a bundled fake binary.
+codex and claude executors through bundled fake binaries.
 
 ## Quick Start
 
@@ -124,7 +134,8 @@ node plugins/dynamic-workflows/scripts/dynamic-workflows.js plan \
   --spec-file my-workflow.json --dry-run --json
 ```
 
-Run detached after granting the approval gate (recommended for codex tasks):
+Run detached after granting the approval gate (recommended for subagent
+(codex/claude) tasks):
 
 ```bash
 node plugins/dynamic-workflows/scripts/dynamic-workflows.js run \
@@ -211,6 +222,9 @@ The current tests cover:
   rejection).
 - The codex executor against a bundled fake codex binary (JSONL parsing,
   thread id capture, schema-violation quarantine, retry policies).
+- The claude executor against a bundled fake claude binary (dispatch routing,
+  exit-0-with-`is_error` failure trap, structured-output quarantine,
+  single-point budget accounting, plan-time network rejection).
 - Cancellation of live runs via the control channel and of planned runs.
 - Detached background execution and crash-safe resume, including
   `--resume-failed`, plus stale-state cleanup for forced re-planning.
