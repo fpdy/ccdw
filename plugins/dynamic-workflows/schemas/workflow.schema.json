@@ -25,7 +25,7 @@
   "properties": {
     "schema_version": { "type": "string" },
     "workflow_id": { "type": "string" },
-    "run_id": { "type": "string" },
+    "run_id": { "type": "string", "pattern": "^(?!\\.+$)[A-Za-z0-9._-]{1,64}$" },
     "name": { "type": "string" },
     "objective": { "type": "string" },
     "phases": {
@@ -49,7 +49,20 @@
       "type": "array",
       "items": { "type": "string" }
     },
-    "workspace_policy": { "type": "object" },
+    "workspace_policy": {
+      "type": "object",
+      "properties": {
+        "workspace_root": { "type": "string" },
+        "write_scope": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["run_dir", "workspace"] }
+        },
+        "network": { "type": "boolean" },
+        "mcp_write": { "const": false },
+        "shell": { "const": false },
+        "worker_isolation": { "type": "string" }
+      }
+    },
     "verification_policy": { "type": "object" },
     "stop_conditions": {
       "type": "array",
@@ -71,11 +84,11 @@
         "outputs"
       ],
       "properties": {
-        "phase_id": { "type": "string" },
+        "phase_id": { "$ref": "#/$defs/specId" },
         "name": { "type": "string" },
-        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
         "entry_condition": { "type": "string" },
-        "tasks": { "type": "array", "items": { "type": "string" } },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
         "completion_condition": { "type": "string" },
         "verification_required": { "type": "boolean" },
         "on_failure": { "type": "string" },
@@ -99,20 +112,49 @@
         "outputs"
       ],
       "properties": {
-        "task_id": { "type": "string" },
-        "phase_id": { "type": "string" },
+        "task_id": { "$ref": "#/$defs/specId" },
+        "phase_id": { "$ref": "#/$defs/specId" },
         "kind": { "type": "string" },
         "role": { "type": "string" },
         "prompt_template": { "type": "string" },
         "input_source": { "type": "string" },
         "fanout_source": { "type": ["string", "null"] },
-        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
         "condition": { "type": "string" },
         "expected_output_schema": { "type": "string" },
-        "retry_policy": { "type": "object" },
+        "retry_policy": { "$ref": "#/$defs/retryPolicy" },
         "verification_required": { "type": "boolean" },
         "stop_condition": { "type": "string" },
         "outputs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "specId": {
+      "type": "string",
+      "pattern": "^(?!\\.+$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "retryPolicy": {
+      "type": "object",
+      "required": [
+        "retryable",
+        "max_attempts",
+        "backoff_ms",
+        "partial_result_policy",
+        "cleanup_required",
+        "goal_status_effect"
+      ],
+      "properties": {
+        "retryable": { "type": "boolean" },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "backoff_ms": { "type": "integer", "minimum": 0 },
+        "partial_result_policy": {
+          "type": "string",
+          "enum": ["quarantine", "accept", "discard"]
+        },
+        "cleanup_required": { "type": "boolean" },
+        "goal_status_effect": {
+          "type": "string",
+          "enum": ["active", "complete", "blocked"]
+        }
       }
     }
   }

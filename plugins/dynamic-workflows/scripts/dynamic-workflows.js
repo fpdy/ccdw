@@ -1,10 +1,14 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   approveWorkflow,
   cancelWorkflow,
+  detachWorkflowRun,
+  listWorkflowRuns,
   planWorkflow,
+  readWorkflowEvents,
   resumeWorkflow,
   runWorkflow,
   statusWorkflow,
@@ -19,25 +23,34 @@ const COMMANDS = new Set([
   "run",
   "resume",
   "status",
+  "list",
+  "events",
   "cancel",
   "validate",
   "validate-plugin-layout",
 ]);
 
-function main() {
+async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
   let result;
   switch (command) {
-    case "plan":
+    case "plan": {
+      let spec;
+      if (options.specFile) {
+        spec = readSpecFile(options.specFile);
+      }
       result = planWorkflow({
         objective: options.objective,
+        spec,
         workspace: options.workspace,
         runRoot: options.runRoot,
         runId: options.runId,
         goalId: options.goalId,
         force: Boolean(options.force),
+        dryRun: Boolean(options.dryRun),
       });
       break;
+    }
     case "approve":
       result = approveWorkflow({
         runDir: options.runDir,
@@ -45,22 +58,47 @@ function main() {
       });
       break;
     case "run":
-      result = runWorkflow({
-        runDir: options.runDir,
-        approve: Boolean(options.approve),
-        approvedBy: options.approvedBy,
-        maxTasks: options.maxTasks,
-      });
+      if (options.detach) {
+        result = detachWorkflowRun({
+          runDir: options.runDir,
+          approve: Boolean(options.approve),
+          approvedBy: options.approvedBy,
+          maxTasks: options.maxTasks,
+        });
+      } else {
+        result = await runWorkflow({
+          runDir: options.runDir,
+          approve: Boolean(options.approve),
+          approvedBy: options.approvedBy,
+          maxTasks: options.maxTasks,
+        });
+      }
       break;
     case "resume":
-      result = resumeWorkflow({
+      result = await resumeWorkflow({
         runDir: options.runDir,
         continueRun: options.continue !== false,
         resumeFailed: Boolean(options.resumeFailed),
+        maxTasks: options.maxTasks,
       });
       break;
     case "status":
       result = statusWorkflow({ runDir: options.runDir });
+      break;
+    case "list":
+      result = listWorkflowRuns({
+        workspace: options.workspace,
+        runRoot: options.runRoot,
+        status: options.status,
+        limit: options.limit,
+      });
+      break;
+    case "events":
+      result = readWorkflowEvents({
+        runDir: options.runDir,
+        sinceOffset: options.sinceOffset,
+        limit: options.limit,
+      });
       break;
     case "cancel":
       result = cancelWorkflow({
@@ -85,7 +123,25 @@ function main() {
     default:
       throw new WorkflowError(`Unknown command: ${command}`);
   }
-  printResult(result, Boolean(options.json));
+  printResult(command, result, Boolean(options.json));
+}
+
+function readSpecFile(specFile) {
+  const resolved = path.resolve(specFile);
+  let raw;
+  try {
+    raw = fs.readFileSync(resolved, "utf8");
+  } catch (error) {
+    throw new WorkflowError(`Could not read spec file: ${error.message}`, { specFile: resolved });
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new WorkflowError(`Spec file is not valid JSON: ${error.message}`, {
+      specFile: resolved,
+      hint: "The workflow spec must be a JSON object (phases[], tasks[], budgets).",
+    });
+  }
 }
 
 function parseArgs(argv) {
@@ -134,7 +190,7 @@ function coerceValue(value) {
   return value;
 }
 
-function printResult(result, asJson) {
+function printResult(command, result, asJson) {
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
     return;
@@ -143,15 +199,41 @@ function printResult(result, asJson) {
     console.log(`Invalid: ${result.errors.join("; ")}`);
     return;
   }
+  if (command === "list") {
+    if (result.runs.length === 0) {
+      console.log(`No runs under ${result.run_root}`);
+      return;
+    }
+    for (const run of result.runs) {
+      const counts = run.task_counts
+        ? Object.entries(run.task_counts)
+            .map(([status, count]) => `${status}:${count}`)
+            .join(" ")
+        : "";
+      console.log(`${run.status.padEnd(18)} ${run.run_id}  ${counts}`);
+      console.log(`  ${run.objective ?? run.warning ?? ""}`);
+      console.log(`  ${run.run_dir}`);
+    }
+    return;
+  }
+  if (command === "events") {
+    for (const event of result.events) {
+      console.log(JSON.stringify(event));
+    }
+    console.log(`next_offset: ${result.next_offset}`);
+    return;
+  }
   console.log(`${result.status ?? "ok"} ${result.run_id ?? ""}`.trim());
   if (result.run_dir) {
     console.log(`run_dir: ${result.run_dir}`);
   }
+  if (result.detached) {
+    console.log(`runner_pid: ${result.runner_pid}`);
+    console.log(`runner_log: ${result.runner_log}`);
+  }
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   const payload = {
     error: error.message,
     details: error.details ?? {},
@@ -165,4 +247,4 @@ try {
     }
   }
   process.exit(1);
-}
+});

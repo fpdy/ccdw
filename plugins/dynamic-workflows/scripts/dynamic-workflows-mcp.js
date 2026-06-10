@@ -2,7 +2,10 @@
 import {
   approveWorkflow,
   cancelWorkflow,
+  detachWorkflowRun,
+  listWorkflowRuns,
   planWorkflow,
+  readWorkflowEvents,
   resumeWorkflow,
   runWorkflow,
   statusWorkflow,
@@ -12,27 +15,29 @@ import fs from "node:fs";
 
 const serverInfo = {
   name: "dynamic-workflows",
-  version: "0.1.0",
+  version: "0.2.0",
 };
 
 const tools = [
   {
     name: "dynamic_workflows_plan",
-    description: "Create a local declarative workflow run and leave it awaiting approval.",
+    description:
+      "Validate and register a workflow run, leaving it awaiting approval. Pass `spec` (a WorkflowSpec JSON object you author: phases[], tasks[] with self-contained prompt_template per task, depends_on, budgets) to run your own plan; tasks with kind starting with \"codex\" execute as real codex exec subagents. Without `spec`, a fixed local explore/verify/synthesize template is planned (a smoke-test scaffold, not a real decomposition). Set dryRun:true to validate a spec without creating a run. Returns the approval summary; render it to the user before approving.",
     inputSchema: {
       type: "object",
-      required: ["objective"],
       properties: {
-        objective: { type: "string" },
-        workspace: { type: "string" },
+        objective: { type: "string", description: "Task objective (required unless spec.objective is set). Max 16000 chars." },
+        spec: { type: "object", description: "Caller-authored WorkflowSpec JSON. Defaults are filled for omitted budget/policy fields." },
+        workspace: { type: "string", description: "Workspace root the workers read (defaults to the server cwd)." },
         runRoot: { type: "string" },
-        runId: { type: "string" },
+        runId: { type: "string", description: "Optional run id matching ^[A-Za-z0-9._-]{1,64}$." },
+        dryRun: { type: "boolean", description: "Validate only; do not create a run directory." },
       },
     },
   },
   {
     name: "dynamic_workflows_approve",
-    description: "Approve a planned workflow run.",
+    description: "Grant the approval gate for a planned run. Only call after the user has seen the approval summary and consented.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -44,7 +49,8 @@ const tools = [
   },
   {
     name: "dynamic_workflows_run",
-    description: "Execute an approved workflow run, optionally granting the approval gate.",
+    description:
+      "Start an approved workflow run. By default the run executes in a detached background process and this tool returns immediately; poll dynamic_workflows_status (cheap) or dynamic_workflows_events to follow progress. Pass detach:false only for fast local-executor runs.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -52,24 +58,30 @@ const tools = [
         runDir: { type: "string" },
         approve: { type: "boolean" },
         approvedBy: { type: "string" },
+        detach: { type: "boolean", description: "Default true. false runs synchronously inside this call." },
+        maxTasks: { type: "integer", minimum: 0, description: "Pause the run after launching this many tasks." },
       },
     },
   },
   {
     name: "dynamic_workflows_resume",
-    description: "Resume a non-terminal workflow run.",
+    description:
+      "Resume a paused or crashed run (re-queues interrupted tasks, reuses completed results). Pass resumeFailed:true to retry a failed run's failed tasks. Refuses while an orchestrator is alive.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
       properties: {
         runDir: { type: "string" },
         continueRun: { type: "boolean" },
+        resumeFailed: { type: "boolean" },
+        approvedBy: { type: "string" },
+        maxTasks: { type: "integer", minimum: 0, description: "Pause the resumed run after launching this many tasks." },
       },
     },
   },
   {
     name: "dynamic_workflows_status",
-    description: "Read workflow run status, tasks, phases, event count, and artifact paths.",
+    description: "Cheap snapshot of a run: status, per-task statuses and counts, budget usage, runner liveness, artifact paths. Safe to poll.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -79,8 +91,34 @@ const tools = [
     },
   },
   {
+    name: "dynamic_workflows_list",
+    description: "Discover workflow runs under the run root (newest first). Use when you do not have a runDir.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace: { type: "string" },
+        runRoot: { type: "string" },
+        status: { type: "string", description: "Filter by run status (e.g. running, paused, completed, failed)." },
+        limit: { type: "integer" },
+      },
+    },
+  },
+  {
+    name: "dynamic_workflows_events",
+    description: "Incrementally read the run's append-only event log. Pass the previous next_offset as sinceOffset to get only new events.",
+    inputSchema: {
+      type: "object",
+      required: ["runDir"],
+      properties: {
+        runDir: { type: "string" },
+        sinceOffset: { type: "integer" },
+        limit: { type: "integer" },
+      },
+    },
+  },
+  {
     name: "dynamic_workflows_cancel",
-    description: "Cancel a non-completed workflow run.",
+    description: "Cancel a non-completed run. If an orchestrator is alive the cancellation is requested via a control signal and folds in within ~1s; poll status to confirm.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -206,7 +244,7 @@ function handleRawMessage(rawMessage, responseFraming) {
     send(
       {
         jsonrpc: "2.0",
-        id: null,
+        id: message?.id ?? null,
         error: {
           code: -32603,
           message: error.message,
@@ -293,19 +331,42 @@ async function handleMessage(message, responseFraming) {
   }
 
   if (message.method === "tools/call") {
-    const result = callTool(message.params?.name, message.params?.arguments ?? {});
+    // Tool failures are returned as result.isError so the client can correlate
+    // and surface them; protocol-level errors are reserved for malformed input.
+    let response;
+    try {
+      const result = await callTool(message.params?.name, message.params?.arguments ?? {});
+      response = {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      response = {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                error: error.message,
+                details: error.details ?? {},
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
     send(
       {
         jsonrpc: "2.0",
         id: message.id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        },
+        result: response,
       },
       responseFraming,
     );
@@ -325,28 +386,61 @@ async function handleMessage(message, responseFraming) {
   );
 }
 
-function callTool(name, args) {
+async function callTool(name, args) {
   switch (name) {
     case "dynamic_workflows_plan":
-      return planWorkflow(args);
+      // Whitelist fields instead of forwarding the args object wholesale.
+      return planWorkflow({
+        objective: args.objective,
+        spec: args.spec,
+        workspace: args.workspace,
+        runRoot: args.runRoot,
+        runId: args.runId,
+        dryRun: Boolean(args.dryRun),
+      });
     case "dynamic_workflows_approve":
       return approveWorkflow({
         runDir: args.runDir,
         approvedBy: args.approvedBy,
       });
     case "dynamic_workflows_run":
+      if (args.detach !== false) {
+        return detachWorkflowRun({
+          runDir: args.runDir,
+          approve: Boolean(args.approve),
+          approvedBy: args.approvedBy,
+          maxTasks: args.maxTasks,
+        });
+      }
       return runWorkflow({
         runDir: args.runDir,
         approve: Boolean(args.approve),
         approvedBy: args.approvedBy,
+        maxTasks: args.maxTasks,
       });
     case "dynamic_workflows_resume":
       return resumeWorkflow({
         runDir: args.runDir,
         continueRun: args.continueRun !== false,
+        resumeFailed: Boolean(args.resumeFailed),
+        approvedBy: args.approvedBy,
+        maxTasks: args.maxTasks,
       });
     case "dynamic_workflows_status":
       return statusWorkflow({ runDir: args.runDir });
+    case "dynamic_workflows_list":
+      return listWorkflowRuns({
+        workspace: args.workspace,
+        runRoot: args.runRoot,
+        status: args.status,
+        limit: args.limit,
+      });
+    case "dynamic_workflows_events":
+      return readWorkflowEvents({
+        runDir: args.runDir,
+        sinceOffset: args.sinceOffset,
+        limit: args.limit,
+      });
     case "dynamic_workflows_cancel":
       return cancelWorkflow({
         runDir: args.runDir,

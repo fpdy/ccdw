@@ -7,7 +7,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   cancelWorkflow,
+  detachWorkflowRun,
+  listWorkflowRuns,
   planWorkflow,
+  readRunState,
+  readWorkflowEvents,
   resumeWorkflow,
   runWorkflow,
   statusWorkflow,
@@ -16,6 +20,7 @@ import {
 } from "../scripts/lib/core.js";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const fakeCodexBin = path.join(pluginRoot, "tests", "fixtures", "fake-codex.js");
 
 function makeTempWorkspace() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "dw-test-"));
@@ -39,6 +44,68 @@ function withEnv(name, value, callback) {
   }
 }
 
+async function withEnvAsync(pairs, callback) {
+  const originals = new Map();
+  for (const [name, value] of Object.entries(pairs)) {
+    originals.set(name, process.env[name]);
+    if (value == null) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+  try {
+    return await callback();
+  } finally {
+    for (const [name, original] of originals) {
+      if (original == null) {
+        delete process.env[name];
+      } else {
+        process.env[name] = original;
+      }
+    }
+  }
+}
+
+function codexSpec({ tasks, phases, ...overrides }) {
+  return {
+    name: "test workflow",
+    objective: "Exercise the codex executor with a fake binary",
+    phases,
+    tasks,
+    max_concurrency: 1,
+    ...overrides,
+  };
+}
+
+function singleCodexTaskSpec(taskOverrides = {}, specOverrides = {}) {
+  return codexSpec({
+    phases: [{ phase_id: "p1", tasks: ["t1"] }],
+    tasks: [
+      {
+        task_id: "t1",
+        phase_id: "p1",
+        kind: "codex_agent",
+        role: "tester",
+        prompt_template: "Run task one.",
+        ...taskOverrides,
+      },
+    ],
+    ...specOverrides,
+  });
+}
+
+async function pollUntil(predicate, { timeoutMs = 10000, intervalMs = 50 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
 test("planWorkflow creates an approval-gated run directory", () => {
   const workspace = makeTempWorkspace();
   const result = planWorkflow({
@@ -48,6 +115,10 @@ test("planWorkflow creates an approval-gated run directory", () => {
 
   assert.equal(result.status, "awaiting_approval");
   assert.equal(result.approval.required, true);
+  assert.ok(result.spec_hash);
+  assert.ok(Array.isArray(result.approval.summary.phases));
+  assert.ok(Array.isArray(result.approval.summary.tasks));
+  assert.equal(result.approval.summary.max_concurrency, 1);
   assert.ok(fs.existsSync(result.paths.workflow_spec));
   assert.ok(fs.existsSync(result.paths.run_state));
   assert.ok(fs.existsSync(result.paths.event_log));
@@ -110,19 +181,165 @@ test("planWorkflow prefers explicit runRoot over CCDW_HOME", () => {
   assert.equal(result.run_dir, path.join(workspace, "explicit-runs", "explicit-run"));
 });
 
-test("runWorkflow enforces approval and completes all local tasks", () => {
+test("planWorkflow rejects runId path traversal", () => {
+  const workspace = makeTempWorkspace();
+  assert.throws(
+    () =>
+      planWorkflow({
+        objective: "Escape the run root",
+        workspace,
+        runId: "../evil",
+      }),
+    /runId/,
+  );
+});
+
+test("planWorkflow rejects unsafe phase and task ids before artifact paths can escape", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: codexSpec({
+      objective: "Reject unsafe ids",
+      phases: [{ phase_id: "../phase", tasks: ["../../../escape-task"] }],
+      tasks: [
+        {
+          task_id: "../../../escape-task",
+          phase_id: "../phase",
+          kind: "local_analysis",
+          role: "w",
+          prompt_template: "x",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((message) => message.includes("phase.phase_id")));
+  assert.ok(result.errors.some((message) => message.includes("task.task_id")));
+  assert.ok(!fs.existsSync(path.join(workspace, ".ccdw")));
+});
+
+test("planWorkflow rejects invalid retry policies", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleCodexTaskSpec({
+      retry_policy: { retryable: true, max_attempts: 2, backoff_ms: "bad" },
+    }),
+  });
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((message) => message.includes("retry_policy.backoff_ms")));
+});
+
+test("planWorkflow rejects unsupported workspace permissions instead of showing them as approved", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleCodexTaskSpec(
+      {},
+      {
+        workspace_policy: {
+          shell: true,
+          mcp_write: true,
+        },
+      },
+    ),
+  });
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((message) => message.includes("workspace_policy.shell")));
+  assert.ok(result.errors.some((message) => message.includes("workspace_policy.mcp_write")));
+});
+
+test("planWorkflow rejects workflow specs with dependency cycles", () => {
+  const workspace = makeTempWorkspace();
+  assert.throws(
+    () =>
+      planWorkflow({
+        workspace,
+        spec: codexSpec({
+          phases: [
+            { phase_id: "a", depends_on: ["b"], tasks: ["ta"] },
+            { phase_id: "b", depends_on: ["a"], tasks: ["tb"] },
+          ],
+          tasks: [
+            { task_id: "ta", phase_id: "a", kind: "local_analysis", role: "w", prompt_template: "x" },
+            { task_id: "tb", phase_id: "b", kind: "local_analysis", role: "w", prompt_template: "y" },
+          ],
+        }),
+      }),
+    (error) => error.details.errors.some((message) => message.includes("cycle")),
+  );
+});
+
+test("planWorkflow dryRun validates a spec without creating a run", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: singleCodexTaskSpec(),
+  });
+  assert.equal(result.dry_run, true);
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.errors, []);
+  assert.ok(!fs.existsSync(path.join(workspace, ".ccdw")));
+});
+
+test("planWorkflow force replaces stale run state and artifacts", () => {
+  const workspace = makeTempWorkspace();
+  const first = planWorkflow({
+    objective: "First plan",
+    workspace,
+    runId: "force-run",
+  });
+  const staleArtifact = path.join(first.run_dir, "artifacts", "stale.txt");
+  fs.writeFileSync(staleArtifact, "stale\n");
+
+  const second = planWorkflow({
+    objective: "Second plan",
+    workspace,
+    runId: "force-run",
+    force: true,
+  });
+
+  assert.equal(second.run_dir, first.run_dir);
+  assert.equal(second.objective, "Second plan");
+  assert.equal(second.event_count, 1);
+  assert.equal(fs.readFileSync(second.paths.event_log, "utf8").trim().split("\n").length, 1);
+  assert.equal(fs.existsSync(staleArtifact), false);
+});
+
+test("approval summary reports only enforced execution sandbox permissions", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    objective: "Inspect approval summary",
+    workspace,
+  });
+
+  assert.equal(planned.approval.summary.shell, undefined);
+  assert.equal(planned.approval.summary.mcp_write, undefined);
+  assert.deepEqual(planned.approval.summary.execution_sandbox, {
+    mode: "read-only",
+    write_scope: ["run_dir"],
+    network_access: false,
+    unsupported_permissions_rejected: ["shell", "mcp_write"],
+  });
+});
+
+test("runWorkflow enforces approval and completes all local tasks", async () => {
   const workspace = makeTempWorkspace();
   const planned = planWorkflow({
     objective: "Execute a deterministic workflow",
     workspace,
   });
 
-  assert.throws(
-    () => runWorkflow({ runDir: planned.run_dir }),
-    /awaiting approval/,
-  );
+  await assert.rejects(() => runWorkflow({ runDir: planned.run_dir }), /awaiting approval/);
 
-  const completed = runWorkflow({
+  const completed = await runWorkflow({
     runDir: planned.run_dir,
     approve: true,
     approvedBy: "test",
@@ -135,16 +352,266 @@ test("runWorkflow enforces approval and completes all local tasks", () => {
   assert.equal(completed.tasks["synthesize-result"].status, "succeeded");
   assert.ok(completed.artifacts.includes("artifacts/synthesis.md"));
   assert.ok(completed.event_count >= 10);
+  assert.equal(completed.runner.active, false);
 });
 
-test("resumeWorkflow leaves terminal runs terminal and records a noop event", () => {
+test("runWorkflow rejects invalid maxTasks without approving the run", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    objective: "Reject invalid maxTasks",
+    workspace,
+  });
+
+  await assert.rejects(
+    () => runWorkflow({ runDir: planned.run_dir, approve: true, maxTasks: "bad" }),
+    /maxTasks/,
+  );
+  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
+});
+
+test("ready-queue scheduler completes phases declared out of dependency order", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: codexSpec({
+      objective: "Out-of-order phase declarations must still execute",
+      phases: [
+        { phase_id: "second", depends_on: ["first"], tasks: ["t2"] },
+        { phase_id: "first", tasks: ["t1"] },
+      ],
+      tasks: [
+        { task_id: "t2", phase_id: "second", kind: "local_analysis", role: "w", prompt_template: "later" },
+        { task_id: "t1", phase_id: "first", kind: "local_analysis", role: "w", prompt_template: "earlier" },
+      ],
+    }),
+  });
+  const completed = await runWorkflow({ runDir: planned.run_dir, approve: true });
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.outcome.status, "success");
+  assert.equal(completed.tasks.t1.status, "succeeded");
+  assert.equal(completed.tasks.t2.status, "succeeded");
+  assert.equal(completed.phases.first.status, "succeeded");
+  assert.equal(completed.phases.second.status, "succeeded");
+});
+
+test("codex executor runs a worker through the fake codex binary", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
+
+  const completed = await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin }, () =>
+    runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.tasks.t1.status, "succeeded");
+  assert.equal(completed.budget_usage.tokens, 150);
+
+  const resultPath = path.join(planned.run_dir, "artifacts", "t1", "result.json");
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  assert.equal(result.task_id, "t1");
+  assert.equal(result.status, "succeeded");
+
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.match(state.attempts[attemptId].thread_id, /^fake-thread-/);
+  assert.ok(fs.existsSync(path.join(planned.run_dir, "worker-output.schema.json")));
+});
+
+test("scheduler runs codex tasks concurrently up to max_concurrency", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: codexSpec({
+      phases: [{ phase_id: "p1", tasks: ["a", "b"] }],
+      tasks: [
+        { task_id: "a", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "task a" },
+        { task_id: "b", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "task b" },
+      ],
+      max_concurrency: 2,
+    }),
+  });
+
+  const completed = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_SLEEP_MS: "600" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+  assert.equal(completed.status, "completed");
+
+  const state = readRunState(planned.run_dir);
+  const traces = ["a", "b"].map((taskId) => {
+    const attemptId = state.tasks[taskId].attempts[0];
+    const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+    return JSON.parse(fs.readFileSync(path.join(attemptDir, "trace.json"), "utf8"));
+  });
+  const overlapStart = Math.max(traces[0].start, traces[1].start);
+  const overlapEnd = Math.min(traces[0].end, traces[1].end);
+  assert.ok(overlapStart < overlapEnd, "expected concurrent execution windows to overlap");
+});
+
+test("worker timeout kills the codex worker and fails the run fail-closed", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: singleCodexTaskSpec({ timeout_ms: 300 }),
+  });
+
+  const result = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_SLEEP_MS: "30000" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "timed_out");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "timed_out");
+});
+
+test("invalid worker output is quarantined as a schema violation", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
+
+  const result = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_INVALID_JSON: "1" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.tasks.t1.status, "schema_violation");
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.equal(state.attempts[attemptId].status, "quarantined");
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  assert.ok(fs.existsSync(path.join(attemptDir, "rejected-result.json")));
+});
+
+test("retry policy relaunches a failed codex worker", async () => {
+  const workspace = makeTempWorkspace();
+  const marker = path.join(workspace, "fail-once.marker");
+  const planned = planWorkflow({
+    workspace,
+    spec: singleCodexTaskSpec({
+      retry_policy: { retryable: true, max_attempts: 2, backoff_ms: 10 },
+    }),
+  });
+
+  const result = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_FAIL_MARKER: marker },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.tasks.t1.status, "succeeded");
+  assert.equal(result.tasks.t1.attempts.length, 2);
+});
+
+test("resume --resume-failed retries failed tasks and completes", async () => {
+  const workspace = makeTempWorkspace();
+  const marker = path.join(workspace, "fail-once.marker");
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
+
+  await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_FAIL_MARKER: marker }, async () => {
+    const failed = await runWorkflow({ runDir: planned.run_dir, approve: true });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.tasks.t1.status, "failed");
+
+    const resumed = await resumeWorkflow({ runDir: planned.run_dir, resumeFailed: true });
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.tasks.t1.status, "succeeded");
+  });
+});
+
+test("token budget is enforced fail-closed between launches", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: codexSpec({
+      phases: [{ phase_id: "p1", tasks: ["t1", "t2"] }],
+      tasks: [
+        { task_id: "t1", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "first" },
+        {
+          task_id: "t2",
+          phase_id: "p1",
+          kind: "codex_agent",
+          role: "w",
+          prompt_template: "second",
+          depends_on: ["t1"],
+        },
+      ],
+      max_tokens: 100,
+    }),
+  });
+
+  const result = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_TOKENS: "5000" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.outcome.summary, /max_tokens/);
+  assert.equal(result.tasks.t2.status, "queued");
+});
+
+test("cancelWorkflow signals a live orchestrator through the control channel", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
+
+  await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_SLEEP_MS: "30000" }, async () => {
+    const runPromise = runWorkflow({ runDir: planned.run_dir, approve: true });
+    const started = await pollUntil(() => {
+      try {
+        return readRunState(planned.run_dir).status === "running";
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(started, "run never reached running status");
+
+    const cancelResult = cancelWorkflow({ runDir: planned.run_dir, reason: "test cancellation" });
+    assert.equal(cancelResult.cancel_requested, true);
+
+    const final = await runPromise;
+    assert.equal(final.status, "cancelled");
+    assert.equal(final.outcome.status, "cancelled");
+    assert.equal(final.outcome.summary, "test cancellation");
+    assert.ok(!fs.existsSync(path.join(planned.run_dir, "control", "cancel.json")));
+  });
+});
+
+test("detached runs execute in a background process", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    objective: "Run detached through the CLI runner",
+    workspace,
+  });
+
+  const detached = detachWorkflowRun({ runDir: planned.run_dir, approve: true });
+  assert.equal(detached.detached, true);
+  assert.ok(detached.runner_pid);
+
+  const finished = await pollUntil(() => {
+    try {
+      return readRunState(planned.run_dir).status === "completed";
+    } catch {
+      return false;
+    }
+  });
+  assert.ok(finished, "detached run never completed");
+  const status = statusWorkflow({ runDir: planned.run_dir });
+  assert.equal(status.status, "completed");
+  assert.equal(status.runner.active, false);
+  assert.ok(fs.existsSync(path.join(planned.run_dir, "runner.log")));
+});
+
+test("resumeWorkflow leaves terminal runs terminal and records a noop event", async () => {
   const workspace = makeTempWorkspace();
   const planned = planWorkflow({
     objective: "Resume a completed workflow",
     workspace,
   });
-  const completed = runWorkflow({ runDir: planned.run_dir, approve: true });
-  const resumed = resumeWorkflow({ runDir: completed.run_dir });
+  const completed = await runWorkflow({ runDir: planned.run_dir, approve: true });
+  const resumed = await resumeWorkflow({ runDir: completed.run_dir });
 
   assert.equal(resumed.status, "completed");
   assert.ok(resumed.event_count > completed.event_count);
@@ -165,6 +632,34 @@ test("cancelWorkflow cancels non-terminal runs", () => {
   assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "cancelled");
 });
 
+test("listWorkflowRuns discovers runs newest first", () => {
+  const workspace = makeTempWorkspace();
+  planWorkflow({ objective: "First run", workspace, runId: "run-one" });
+  planWorkflow({ objective: "Second run", workspace, runId: "run-two" });
+
+  const listing = listWorkflowRuns({ workspace });
+  assert.equal(listing.runs.length, 2);
+  assert.ok(listing.runs.every((run) => run.status === "awaiting_approval"));
+  assert.ok(listing.runs.every((run) => run.task_counts.queued === 3));
+
+  const filtered = listWorkflowRuns({ workspace, status: "completed" });
+  assert.equal(filtered.runs.length, 0);
+});
+
+test("readWorkflowEvents returns incremental events with a byte cursor", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Tail events", workspace });
+
+  const first = readWorkflowEvents({ runDir: planned.run_dir });
+  assert.ok(first.events.length >= 1);
+  assert.equal(first.events[0].type, "workflow_planned");
+  assert.ok(first.next_offset > 0);
+
+  const second = readWorkflowEvents({ runDir: planned.run_dir, sinceOffset: first.next_offset });
+  assert.equal(second.events.length, 0);
+  assert.equal(second.next_offset, first.next_offset);
+});
+
 test("CLI plan and run commands work with JSON output", () => {
   const workspace = makeTempWorkspace();
   const cli = path.join(pluginRoot, "scripts", "dynamic-workflows.js");
@@ -182,6 +677,42 @@ test("CLI plan and run commands work with JSON output", () => {
   const completed = JSON.parse(runOutput);
 
   assert.equal(completed.status, "completed");
+});
+
+test("CLI plan accepts a caller-authored spec file", () => {
+  const workspace = makeTempWorkspace();
+  const cli = path.join(pluginRoot, "scripts", "dynamic-workflows.js");
+  const specPath = path.join(workspace, "spec.json");
+  fs.writeFileSync(
+    specPath,
+    JSON.stringify(
+      codexSpec({
+        objective: "Caller-authored plan via spec file",
+        phases: [{ phase_id: "only", tasks: ["solo"] }],
+        tasks: [
+          { task_id: "solo", phase_id: "only", kind: "local_analysis", role: "w", prompt_template: "inspect" },
+        ],
+      }),
+    ),
+  );
+
+  const planned = JSON.parse(
+    execFileSync(
+      "node",
+      [cli, "plan", "--spec-file", specPath, "--workspace", workspace, "--json"],
+      { encoding: "utf8" },
+    ),
+  );
+  assert.equal(planned.status, "awaiting_approval");
+  assert.equal(planned.objective, "Caller-authored plan via spec file");
+
+  const completed = JSON.parse(
+    execFileSync("node", [cli, "run", "--run-dir", planned.run_dir, "--approve", "--json"], {
+      encoding: "utf8",
+    }),
+  );
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.tasks.solo.status, "succeeded");
 });
 
 test("validatePluginLayout sees the expected plugin files", () => {
@@ -213,6 +744,8 @@ test("MCP server initializes, lists tools, and plans a workflow", async (t) => {
     method: "tools/list",
   });
   assert.ok(listed.result.tools.some((tool) => tool.name === "dynamic_workflows_plan"));
+  assert.ok(listed.result.tools.some((tool) => tool.name === "dynamic_workflows_list"));
+  assert.ok(listed.result.tools.some((tool) => tool.name === "dynamic_workflows_events"));
 
   const planned = await client.request({
     jsonrpc: "2.0",
@@ -229,6 +762,38 @@ test("MCP server initializes, lists tools, and plans a workflow", async (t) => {
   const payload = JSON.parse(planned.result.content[0].text);
   assert.equal(payload.status, "awaiting_approval");
   assert.ok(fs.existsSync(payload.paths.run_state));
+});
+
+test("MCP tool errors are returned as isError results with the request id", async (t) => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Approval gate over MCP", workspace });
+  const server = spawn("node", [path.join(pluginRoot, "scripts", "dynamic-workflows-mcp.js")], {
+    cwd: pluginRoot,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => server.kill());
+  const client = createMcpClient(server);
+
+  await client.request({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2024-11-05" },
+  });
+
+  const response = await client.request({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "dynamic_workflows_run",
+      arguments: { runDir: planned.run_dir },
+    },
+  });
+  assert.equal(response.id, 2);
+  assert.equal(response.result.isError, true);
+  const payload = JSON.parse(response.result.content[0].text);
+  assert.match(payload.error, /approval/i);
 });
 
 test("MCP config starts from the plugin root", async (t) => {
