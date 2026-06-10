@@ -79,10 +79,22 @@ Rules for good specs:
 - The runner rejects `workspace_policy.shell:true` and `mcp_write:true`; the
   approval summary reports the actually enforced Codex sandbox and network
   access instead.
-- Expand fan-out yourself at plan time (one task per file group/claim/area).
+- Expand fan-out yourself at plan time (one task per file group/claim/area);
+  `fanout_source` must stay null because the runner never expands it.
+- Conditions must match what the engine actually does: `entry_condition` /
+  `condition` accept only `"always"` (empty `depends_on`) or
+  `"dependencies_succeeded"`, `completion_condition` only
+  `"all_tasks_succeeded"`, and task `stop_condition` only
+  `"budget_or_cancelled"`. Plan rejects anything else.
 - Keep `max_concurrency` low (2-4); each worker is a full Codex session.
 - Set per-task `timeout_ms` and a run-level `max_tokens`; the runner enforces
-  both fail-closed.
+  both fail-closed. Token accounting is approximate: cached input tokens are
+  not counted and multi-turn workers re-count input per turn, so leave margin
+  in `max_tokens` rather than sizing it exactly.
+- `max_cost`, `max_retries`, `max_no_progress_iterations`,
+  `verification_required`, and `verification_policy` are advisory: they are
+  recorded and shown in the approval summary's `advisory_fields`, but the
+  runner does not enforce them (use per-task `retry_policy` for retries).
 - Use a verification phase that tries to REFUTE earlier findings rather than
   restate them.
 
@@ -120,6 +132,9 @@ Validate without side effects first: `plan --spec-file spec.json --dry-run --jso
 - `cancel --run-dir <d> --reason "..."` stops a live run via the control
   channel; confirm with `status` afterwards.
 - A crashed run (status running, `runner.active: false`) recovers with `resume`.
+- If `resume` refuses with a `runner_pid` that is not actually a ccdw
+  orchestrator (PID reuse after a crash), verify the process, delete
+  `<run_dir>/orchestrator.lock`, and resume again.
 
 ## Guardrails
 

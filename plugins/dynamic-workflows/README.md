@@ -32,6 +32,20 @@ workspace-write mode. The runner rejects `workspace_policy.shell:true` and
 `workspace_policy.mcp_write:true` because those permissions are not enforced by
 the current Codex invocation.
 
+Plan-time validation is strict: `entry_condition` / `condition` accept only
+`always` (with empty `depends_on`) or `dependencies_succeeded`,
+`completion_condition` only `all_tasks_succeeded`, task `stop_condition` only
+`budget_or_cancelled`, and `fanout_source` must stay `null` (expand fan-out at
+plan time). `max_cost`, `max_retries`, `max_no_progress_iterations`,
+`verification_required`, and `verification_policy` are accepted but advisory;
+the approval summary lists them under `advisory_fields` so approval reflects
+what the runner actually enforces. Already-planned run directories are re-read
+with the previous, lenient rules.
+
+Token accounting is approximate: `cached_input_tokens` are not counted toward
+`max_tokens`, and multi-turn workers re-count their input tokens each turn, so
+budget with margin instead of sizing `max_tokens` exactly.
+
 The plugin intentionally does not hook or replace Codex's built-in `/goal`
 command. Invoke the bundled skill or call the runner directly.
 
@@ -54,9 +68,15 @@ By default, runs are stored under `.ccdw/dynamic-workflows/runs`. Set
 single run.
 
 `run --detach` starts a background orchestrator (PID in `orchestrator.lock`,
-output in `runner.log`) and returns immediately; poll `status` or `events`.
+output in `runner.log`) and returns once the orchestrator has taken the run
+lock (or errors if the runner dies on startup); poll `status` or `events`.
 Cancellation of a live run goes through `control/cancel.json` so the
 orchestrator can kill its worker process groups cleanly.
+
+Liveness checks compare the lock PID against running processes. If the
+orchestrator crashed and its PID was reused by an unrelated process, `resume`
+keeps refusing; verify the process is not a ccdw runner, delete
+`<run_dir>/orchestrator.lock`, and resume again.
 
 `--max-tasks` must be a non-negative integer and pauses a run after that many
 task launches. `plan --force --run-id <id>` replaces an existing non-running run

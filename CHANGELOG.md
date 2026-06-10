@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0 - 2026-06-10
+
+### Changed (breaking for new plans)
+
+- Plan-time spec validation is strict about fields the engine does not implement: `entry_condition` / `condition` accept only `always` (with empty `depends_on`) or `dependencies_succeeded`, `completion_condition` only `all_tasks_succeeded`, task `stop_condition` only `budget_or_cancelled`, and `fanout_source` must stay `null`. Previously these values were accepted and silently ignored. Already-planned run directories are still re-read with the lenient rules, so existing runs keep working.
+- The approval summary now lists `advisory_fields` (`max_cost`, `max_retries`, `max_no_progress_iterations`, `verification_required`, `verification_policy`) as recorded-but-not-enforced, and its `budget` block only shows the budgets the runner actually enforces (`max_tokens`, `max_duration_ms`). `workflow.schema.json` documents the strict enums.
+
+### Added
+
+- `run --detach` now waits up to ~2 seconds for the spawned orchestrator to take the run lock and fails with a `runner.log` pointer if the runner dies on startup, instead of reporting `detached: true` for a dead-on-arrival child (closes the double-detach race). `detachWorkflowRun` is async accordingly.
+- A spec-authored `input_source` that resolves outside the run directory and workspace root now records an `input_path_warning` audit event before the worker launches.
+
+### Fixed
+
+- Worker promises that survive the abort grace period (cancellation or fail-closed budget stops) no longer write task/attempt state or events after the orchestrator has folded the run, so a zombie continuation cannot rewrite `run.json` after the run lock is released.
+
+### Documentation
+
+- README and SKILL.md document the strict plan-time validation, the advisory fields, the approximate token accounting (cached input tokens uncounted, multi-turn input re-counted per turn), and the manual `orchestrator.lock` removal recovery for PID-reuse false positives. The MCP plan tool description notes that overwriting an existing runId requires the CLI's `plan --force`.
+
 ## v0.2.1 - 2026-06-10
 
 ### Fixed

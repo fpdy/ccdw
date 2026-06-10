@@ -45,6 +45,17 @@ const RETRYABLE_TASK_STATUSES = new Set(["failed", "timed_out", "schema_violatio
 // blocker, and the scheduler re-skips any task whose blocker is still dead.
 const RESUMABLE_TASK_STATUSES = new Set([...RETRYABLE_TASK_STATUSES, "skipped"]);
 
+// Spec fields that are recorded and surfaced to the approver but not enforced
+// by the scheduler. They are listed in the approval summary so consent is
+// based on what the runner actually does.
+export const ADVISORY_SPEC_FIELDS = [
+  "max_cost",
+  "max_retries",
+  "max_no_progress_iterations",
+  "verification_required",
+  "verification_policy",
+];
+
 export class WorkflowError extends Error {
   constructor(message, details = {}) {
     super(message);
@@ -82,7 +93,9 @@ export function planWorkflow(options = {}) {
     });
   }
 
-  const workflowErrors = validateWorkflowSpec(workflow);
+  // Strict validation applies to new plans only; stored runs are re-read with
+  // the lenient rules so a strictness upgrade never bricks existing run dirs.
+  const workflowErrors = validateWorkflowSpec(workflow, { strict: true });
   if (options.dryRun) {
     return {
       dry_run: true,
@@ -483,7 +496,7 @@ export function readWorkflowEvents(options = {}) {
   return { run_dir: runDir, events, next_offset: sinceOffset + Buffer.byteLength(chunk.slice(0, consumed), "utf8") };
 }
 
-export function detachWorkflowRun(options = {}) {
+export async function detachWorkflowRun(options = {}) {
   const maxTasks = normalizeOptionalMaxTasks(options.maxTasks);
   const runDir = requireRunDir(options.runDir);
   const liveLock = readLiveLock(runDir);
@@ -517,14 +530,34 @@ export function detachWorkflowRun(options = {}) {
   const logPath = path.join(runDir, RUNNER_LOG_FILE);
   const logFd = fs.openSync(logPath, "a");
   let child;
+  let childExit = null;
   try {
     child = spawn(process.execPath, args, {
       detached: true,
       stdio: ["ignore", logFd, logFd],
     });
+    child.once("exit", (code, signal) => {
+      childExit = { code, signal };
+    });
     child.unref();
   } finally {
     fs.closeSync(logFd);
+  }
+  // Two concurrent detach calls can both pass the lock precheck; the loser
+  // child dies immediately with only runner.log to show for it. Wait briefly
+  // for the lock to appear (or the child to exit) so a dead-on-arrival runner
+  // surfaces as an error instead of detached:true. A fast local run may finish
+  // entirely inside this window, which exits 0 and is fine.
+  const pollDeadline = Date.now() + 2000;
+  while (Date.now() < pollDeadline && childExit == null && !readLiveLock(runDir)) {
+    await sleep(50);
+  }
+  if (childExit != null && (childExit.signal != null || childExit.code !== 0)) {
+    throw new WorkflowError("Detached runner exited before executing the run; see the runner log.", {
+      exit_code: childExit.code,
+      signal: childExit.signal,
+      runner_log: logPath,
+    });
   }
   const state = readRunState(runDir);
   const workflow = readWorkflowSpec(runDir);
@@ -682,7 +715,8 @@ export function applySpecDefaults(spec, { objective, workspace, runId, workflowI
 
 // --- Validation ------------------------------------------------------------
 
-export function validateWorkflowSpec(workflow) {
+export function validateWorkflowSpec(workflow, options = {}) {
+  const strict = options.strict === true;
   const errors = [];
   requireString(workflow, "schema_version", errors);
   requireString(workflow, "workflow_id", errors);
@@ -731,6 +765,18 @@ export function validateWorkflowSpec(workflow) {
     if (phase.on_failure !== "fail" && phase.on_failure !== "continue") {
       errors.push(`phase ${phase.phase_id} on_failure must be "fail" or "continue"`);
     }
+    if (strict) {
+      if (phase.entry_condition !== "always" && phase.entry_condition !== "dependencies_succeeded") {
+        errors.push(`phase ${phase.phase_id} entry_condition must be "always" or "dependencies_succeeded"`);
+      } else if (phase.entry_condition === "always" && (phase.depends_on ?? []).length > 0) {
+        errors.push(
+          `phase ${phase.phase_id} entry_condition "always" contradicts depends_on; the engine always waits for dependency phases to succeed`,
+        );
+      }
+      if (phase.completion_condition !== "all_tasks_succeeded") {
+        errors.push(`phase ${phase.phase_id} completion_condition must be "all_tasks_succeeded"`);
+      }
+    }
   }
   for (const task of workflow.tasks ?? []) {
     requireString(task, "task_id", errors, "task");
@@ -748,6 +794,23 @@ export function validateWorkflowSpec(workflow) {
     }
     if (task.timeout_ms != null && (!Number.isInteger(task.timeout_ms) || task.timeout_ms < 1)) {
       errors.push(`task ${task.task_id} timeout_ms must be a positive integer`);
+    }
+    if (strict) {
+      if (task.condition !== "always" && task.condition !== "dependencies_succeeded") {
+        errors.push(`task ${task.task_id} condition must be "always" or "dependencies_succeeded"`);
+      } else if (task.condition === "always" && (task.depends_on ?? []).length > 0) {
+        errors.push(
+          `task ${task.task_id} condition "always" contradicts depends_on; the engine always waits for dependency tasks to succeed`,
+        );
+      }
+      if (task.stop_condition !== "budget_or_cancelled") {
+        errors.push(`task ${task.task_id} stop_condition must be "budget_or_cancelled"`);
+      }
+      if (task.fanout_source != null) {
+        errors.push(
+          `task ${task.task_id} fanout_source is not executed by the runner; expand fan-out at plan time and leave it null`,
+        );
+      }
     }
     if (taskIds.has(task.task_id)) {
       errors.push(`duplicate task_id: ${task.task_id}`);
@@ -876,6 +939,10 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
   const inFlight = new Map();
   const settledQueue = [];
   const retryAt = new Map();
+  // Sealed after abortInFlight: a worker promise that survives the abort grace
+  // period must not touch run state or the event log once the orchestrator has
+  // folded the run, or it would rewrite run.json after the lock is released.
+  const runContext = { sealed: false };
   let launchedThisRun = 0;
   let lastHeartbeat = 0;
 
@@ -926,6 +993,7 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
         sleep(8000),
       ]);
     }
+    runContext.sealed = true;
     const timestamp = nowIso();
     for (const taskId of inFlight.keys()) {
       if (state.tasks[taskId].status === "running") {
@@ -1112,18 +1180,20 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
 
     const handle = { cancel: null };
     const runAttempt = isCodex
-      ? () => runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, startedAt)
+      ? () => runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, startedAt, runContext)
       : async () => runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir);
     const promise = (async () => {
       try {
         await runAttempt();
       } catch (error) {
-        state.attempts[attemptId].status = "failed";
-        state.attempts[attemptId].completed_at = nowIso();
-        setTaskStatus(runDir, state, task.task_id, "failed", {
-          reason: "executor_error",
-          error: error.message,
-        });
+        if (!runContext.sealed) {
+          state.attempts[attemptId].status = "failed";
+          state.attempts[attemptId].completed_at = nowIso();
+          setTaskStatus(runDir, state, task.task_id, "failed", {
+            reason: "executor_error",
+            error: error.message,
+          });
+        }
       }
       return task.task_id;
     })();
@@ -1249,14 +1319,14 @@ async function executeApprovedRun(runDir, workflow, state, options = {}) {
 
 // --- Executors -------------------------------------------------------------
 
-async function runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt) {
+async function runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext) {
   const schemaPath = path.join(runDir, WORKER_SCHEMA_FILE);
   if (!fs.existsSync(schemaPath)) {
     writeJson(schemaPath, WORKER_OUTPUT_SCHEMA);
   }
   const lastMessagePath = path.join(attemptDir, "last-message.txt");
   const workerEventsPath = path.join(attemptDir, "codex-events.jsonl");
-  const inputPaths = resolveTaskInputs(runDir, state, task);
+  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
   const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
   const remainingMs = workflow.max_duration_ms - (Date.now() - runStartedAt);
   const timeoutMs = Math.max(Math.min(task.timeout_ms ?? Infinity, remainingMs), 1000);
@@ -1278,6 +1348,9 @@ async function runCodexAttempt(runDir, workflow, state, task, attemptId, attempt
         fs.appendFileSync(workerEventsPath, `${JSON.stringify(event)}\n`, "utf8");
       } catch {
         // Telemetry capture is best-effort.
+      }
+      if (runContext.sealed) {
+        return;
       }
       if (event.type === "thread.started") {
         attempt.thread_id = event.thread_id;
@@ -1315,6 +1388,10 @@ async function runCodexAttempt(runDir, workflow, state, task, attemptId, attempt
   });
 
   const outcome = await exec.promise;
+  if (runContext.sealed) {
+    // The orchestrator already aborted and folded this attempt.
+    return;
+  }
   attempt.completed_at = nowIso();
 
   const finishAttempt = (attemptStatus, taskStatus, payload) => {
@@ -1474,7 +1551,7 @@ function runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir) {
   });
 }
 
-function resolveTaskInputs(runDir, state, task) {
+function resolveTaskInputs(runDir, workflow, state, task) {
   const source = task.input_source;
   if (source == null || source === "objective") {
     return [];
@@ -1485,9 +1562,26 @@ function resolveTaskInputs(runDir, state, task) {
       .map((taskState) => path.join(runDir, taskState.result_path));
   }
   const sources = Array.isArray(source) ? source : [source];
-  return sources.map((candidate) =>
+  const resolved = sources.map((candidate) =>
     path.isAbsolute(candidate) ? candidate : path.join(runDir, candidate),
   );
+  // Reads are not sandboxed the way artifact writes are; record an audit
+  // event when a spec-authored input points outside the run and workspace.
+  const allowedRoots = [path.resolve(runDir), path.resolve(workflow.workspace_policy?.workspace_root ?? runDir)];
+  for (const inputPath of resolved) {
+    const normalized = path.resolve(inputPath);
+    const contained = allowedRoots.some(
+      (root) => normalized === root || normalized.startsWith(root + path.sep),
+    );
+    if (!contained) {
+      recordEvent(runDir, state, "input_path_warning", {
+        task_id: task.task_id,
+        input_path: normalized,
+        reason: "input_source resolves outside the run directory and workspace root",
+      });
+    }
+  }
+  return resolved;
 }
 
 // --- Default template ------------------------------------------------------
@@ -1696,8 +1790,11 @@ function buildInitialRunState({ workflow, goalId, createdAt, specHash }) {
         },
         budget: {
           max_tokens: workflow.max_tokens,
-          max_cost: workflow.max_cost,
           max_duration_ms: workflow.max_duration_ms,
+        },
+        advisory_fields: {
+          note: "Recorded in the spec and shown here, but not enforced by the runner.",
+          fields: [...ADVISORY_SPEC_FIELDS],
         },
         stop_conditions: workflow.stop_conditions,
       },

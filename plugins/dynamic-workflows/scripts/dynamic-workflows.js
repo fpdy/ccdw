@@ -59,7 +59,7 @@ async function main() {
       break;
     case "run":
       if (options.detach) {
-        result = detachWorkflowRun({
+        result = await detachWorkflowRun({
           runDir: options.runDir,
           approve: Boolean(options.approve),
           approvedBy: options.approvedBy,

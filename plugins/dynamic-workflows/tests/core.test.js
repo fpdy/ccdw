@@ -691,7 +691,7 @@ test("detached runs execute in a background process", async () => {
     workspace,
   });
 
-  const detached = detachWorkflowRun({ runDir: planned.run_dir, approve: true });
+  const detached = await detachWorkflowRun({ runDir: planned.run_dir, approve: true });
   assert.equal(detached.detached, true);
   assert.ok(detached.runner_pid);
 
@@ -1005,6 +1005,105 @@ test("MCP server accepts Codex newline-delimited JSON framing", { timeout: 3000 
   });
 
   assert.ok(listed.result.tools.some((tool) => tool.name === "dynamic_workflows_plan"));
+});
+
+test("plan strictly rejects conditions the engine does not implement", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: codexSpec({
+      objective: "Reject spec fields that contradict the engine",
+      phases: [
+        { phase_id: "p1", tasks: ["t1"] },
+        {
+          phase_id: "p2",
+          depends_on: ["p1"],
+          entry_condition: "always",
+          completion_condition: "any",
+          tasks: ["t2"],
+        },
+      ],
+      tasks: [
+        { task_id: "t1", phase_id: "p1", kind: "local_analysis", role: "w", prompt_template: "x" },
+        {
+          task_id: "t2",
+          phase_id: "p2",
+          kind: "local_analysis",
+          role: "w",
+          prompt_template: "y",
+          depends_on: ["t1"],
+          condition: "always",
+          stop_condition: "never",
+          fanout_source: "findings",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((message) => message.includes('phase p2 entry_condition "always"')));
+  assert.ok(result.errors.some((message) => message.includes("phase p2 completion_condition")));
+  assert.ok(result.errors.some((message) => message.includes('task t2 condition "always"')));
+  assert.ok(result.errors.some((message) => message.includes("task t2 stop_condition")));
+  assert.ok(result.errors.some((message) => message.includes("task t2 fanout_source")));
+});
+
+test("approval summary reports advisory fields and only enforced budgets", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Advisory fields surface in the summary", workspace });
+
+  const summary = planned.approval.summary;
+  assert.deepEqual(summary.budget, { max_tokens: 100000, max_duration_ms: 300000 });
+  assert.ok(summary.advisory_fields.fields.includes("max_cost"));
+  assert.ok(summary.advisory_fields.fields.includes("max_retries"));
+  assert.ok(summary.advisory_fields.fields.includes("verification_policy"));
+});
+
+test("strict validation applies at plan time only; stored specs re-read leniently", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Legacy spec values stay readable", workspace });
+
+  const specPath = path.join(planned.run_dir, "workflow.yaml");
+  const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
+  spec.phases[0].completion_condition = "any";
+  spec.tasks[0].stop_condition = "never";
+  fs.writeFileSync(specPath, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
+
+  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
+  assert.equal(validateRunDirectory({ runDir: planned.run_dir }).valid, true);
+});
+
+test("input_source outside the run and workspace records an audit warning event", async () => {
+  const workspace = makeTempWorkspace();
+  const outside = path.join(makeTempWorkspace(), "external-input.json");
+  fs.writeFileSync(outside, "{}\n", "utf8");
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec({ input_source: outside }) });
+
+  const completed = await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin }, () =>
+    runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  const warning = events.find((event) => event.type === "input_path_warning");
+  assert.ok(warning, "expected an input_path_warning event");
+  assert.equal(warning.payload.task_id, "t1");
+  assert.equal(warning.payload.input_path, outside);
+});
+
+test("detach surfaces a runner that dies before executing the run", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Detach a dead-on-arrival runner", workspace });
+
+  // A run marked running with no live lock passes the detach prechecks, but
+  // the spawned child refuses it and exits non-zero immediately.
+  const statePath = path.join(planned.run_dir, "run.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.status = "running";
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  await assert.rejects(() => detachWorkflowRun({ runDir: planned.run_dir }), /runner log/);
 });
 
 function createMcpClient(child, options = {}) {

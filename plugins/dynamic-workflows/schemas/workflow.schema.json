@@ -87,11 +87,11 @@
         "phase_id": { "$ref": "#/$defs/specId" },
         "name": { "type": "string" },
         "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
-        "entry_condition": { "type": "string" },
+        "entry_condition": { "type": "string", "enum": ["always", "dependencies_succeeded"] },
         "tasks": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
-        "completion_condition": { "type": "string" },
+        "completion_condition": { "const": "all_tasks_succeeded" },
         "verification_required": { "type": "boolean" },
-        "on_failure": { "type": "string" },
+        "on_failure": { "type": "string", "enum": ["fail", "continue"] },
         "outputs": { "type": "array", "items": { "type": "string" } }
       }
     },
@@ -117,14 +117,17 @@
         "kind": { "type": "string" },
         "role": { "type": "string" },
         "prompt_template": { "type": "string" },
-        "input_source": { "type": "string" },
-        "fanout_source": { "type": ["string", "null"] },
+        "input_source": {
+          "type": ["string", "array"],
+          "items": { "type": "string" }
+        },
+        "fanout_source": { "const": null },
         "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
-        "condition": { "type": "string" },
+        "condition": { "type": "string", "enum": ["always", "dependencies_succeeded"] },
         "expected_output_schema": { "type": "string" },
         "retry_policy": { "$ref": "#/$defs/retryPolicy" },
         "verification_required": { "type": "boolean" },
-        "stop_condition": { "type": "string" },
+        "stop_condition": { "const": "budget_or_cancelled" },
         "outputs": { "type": "array", "items": { "type": "string" } }
       }
     },
