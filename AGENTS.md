@@ -1,2 +1,3 @@
 - ccdw-managed local state and generated artifacts are stored under `.ccdw` by default.
 - Set `CCDW_HOME` to relocate ccdw-managed local state; relative values resolve from the workspace root.
+- When executing a command, always take "side effects" not to make unintended changes.

@@ -15,4 +15,11 @@ node_modules/
 opencode.jsonc
 .codex/
 .agents/
+.claude
 skills-lock.json
+.ignore
+AGENTS.md
+CLAUDE.md
+
+# local docs
+docs/local
