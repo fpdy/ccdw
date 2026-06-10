@@ -159,7 +159,7 @@ function parseArgs(argv) {
     const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
     const key = toCamelCase(rawKey);
     if (inlineValue !== undefined) {
-      options[key] = coerceValue(inlineValue);
+      options[key] = coerceValue(key, rawKey, inlineValue);
       continue;
     }
     const next = argv[index + 1];
@@ -167,7 +167,7 @@ function parseArgs(argv) {
       options[key] = true;
       continue;
     }
-    options[key] = coerceValue(next);
+    options[key] = coerceValue(key, rawKey, next);
     index += 1;
   }
   return { command, options };
@@ -177,14 +177,30 @@ function toCamelCase(value) {
   return value.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 }
 
-function coerceValue(value) {
-  if (value === "true") {
-    return true;
+// Only flags that are typed numeric/boolean get coerced; everything else stays
+// a string so values like `--run-id 123` are never turned into numbers.
+const NUMBER_OPTIONS = new Set(["maxTasks", "sinceOffset", "limit"]);
+const BOOLEAN_OPTIONS = new Set([
+  "approve",
+  "continue",
+  "detach",
+  "dryRun",
+  "force",
+  "json",
+  "resumeFailed",
+]);
+
+function coerceValue(key, rawKey, value) {
+  if (BOOLEAN_OPTIONS.has(key)) {
+    if (value === "true") {
+      return true;
+    }
+    if (value === "false") {
+      return false;
+    }
+    throw new WorkflowError(`--${rawKey} expects true or false.`, { value });
   }
-  if (value === "false") {
-    return false;
-  }
-  if (/^\d+$/.test(value)) {
+  if (NUMBER_OPTIONS.has(key) && /^\d+$/.test(value)) {
     return Number(value);
   }
   return value;

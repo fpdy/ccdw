@@ -15,7 +15,7 @@ import fs from "node:fs";
 
 const serverInfo = {
   name: "dynamic-workflows",
-  version: "0.2.0",
+  version: "0.2.1",
 };
 
 const tools = [
@@ -66,7 +66,7 @@ const tools = [
   {
     name: "dynamic_workflows_resume",
     description:
-      "Resume a paused or crashed run (re-queues interrupted tasks, reuses completed results). Pass resumeFailed:true to retry a failed run's failed tasks. Refuses while an orchestrator is alive.",
+      "Resume a paused or crashed run (re-queues interrupted tasks, reuses completed results). Pass resumeFailed:true to retry the failed and skipped tasks of a failed run, or of a completed run whose outcome is partial. Refuses while an orchestrator is alive.",
     inputSchema: {
       type: "object",
       required: ["runDir"],

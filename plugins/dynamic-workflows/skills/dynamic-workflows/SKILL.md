@@ -114,7 +114,9 @@ Validate without side effects first: `plan --spec-file spec.json --dry-run --jso
 - `paused`: report the exact reason (e.g. max-tasks reached) and offer resume.
 - `failed`: inspect the last events and the failing task's artifacts under
   `artifacts/<task_id>/`, then offer `resume --run-dir <d> --resume-failed --json`
-  (re-runs failed tasks, keeps succeeded results).
+  (re-runs failed and skipped tasks, keeps succeeded results).
+- `completed` with outcome `partial`: `--resume-failed` works here too — it
+  re-runs only the failed/skipped tasks and reuses every succeeded result.
 - `cancel --run-dir <d> --reason "..."` stops a live run via the control
   channel; confirm with `status` afterwards.
 - A crashed run (status running, `runner.active: false`) recovers with `resume`.

@@ -41,6 +41,9 @@ const PERMANENT_FAILURE_TASK_STATUSES = new Set([
 ]);
 const TERMINAL_TASK_STATUSES = new Set(["succeeded", ...PERMANENT_FAILURE_TASK_STATUSES]);
 const RETRYABLE_TASK_STATUSES = new Set(["failed", "timed_out", "schema_violation"]);
+// Resume may also requeue skipped tasks: a skip is always derived from a failed
+// blocker, and the scheduler re-skips any task whose blocker is still dead.
+const RESUMABLE_TASK_STATUSES = new Set([...RETRYABLE_TASK_STATUSES, "skipped"]);
 
 export class WorkflowError extends Error {
   constructor(message, details = {}) {
@@ -53,8 +56,8 @@ export class WorkflowError extends Error {
 export function planWorkflow(options = {}) {
   const workspace = path.resolve(options.workspace ?? process.cwd());
   const runId = options.runId ?? makeId("run");
-  if (!RUN_ID_PATTERN.test(runId)) {
-    throw new WorkflowError("runId must match ^[A-Za-z0-9._-]{1,64}$.", { runId });
+  if (typeof runId !== "string" || !RUN_ID_PATTERN.test(runId)) {
+    throw new WorkflowError("runId must be a string matching ^[A-Za-z0-9._-]{1,64}$.", { runId });
   }
   const workflowId = options.workflowId ?? makeId("wf");
   const createdAt = nowIso();
@@ -257,7 +260,10 @@ export async function resumeWorkflow(options = {}) {
     });
   }
 
-  const resumableFailure = state.status === "failed" && options.resumeFailed === true;
+  const resumableFailure =
+    options.resumeFailed === true &&
+    (state.status === "failed" ||
+      (state.status === "completed" && state.outcome?.status === "partial"));
   if (TERMINAL_RUN_STATUSES.has(state.status) && !resumableFailure) {
     recordEvent(runDir, state, "resume_noop", { reason: `terminal:${state.status}` });
     return summarizeRun(runDir, readRunState(runDir), workflow);
@@ -273,6 +279,7 @@ export async function resumeWorkflow(options = {}) {
 
   withRunLock(runDir, () => {
     state = readRunState(runDir);
+    const fromStatus = state.status;
     const timestamp = nowIso();
     for (const [attemptId, attempt] of Object.entries(state.attempts ?? {})) {
       if (attempt.status === "running" || attempt.status === "created") {
@@ -289,7 +296,7 @@ export async function resumeWorkflow(options = {}) {
         taskState.status = "queued";
         taskState.updated_at = timestamp;
       }
-      if (resumableFailure && RETRYABLE_TASK_STATUSES.has(taskState.status)) {
+      if (resumableFailure && RESUMABLE_TASK_STATUSES.has(taskState.status)) {
         taskState.status = "queued";
         taskState.updated_at = timestamp;
       }
@@ -314,6 +321,7 @@ export async function resumeWorkflow(options = {}) {
     recordEvent(runDir, state, "resume_requested", {
       continue: options.continueRun !== false,
       resume_failed: resumableFailure,
+      from_status: fromStatus,
     });
   });
 

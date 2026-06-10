@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.1 - 2026-06-10
+
+### Fixed
+
+- `resume --resume-failed` now requeues skipped tasks alongside failed ones, so a task that was skipped because its blocker failed runs once the blocker succeeds on resume; tasks whose blocker fails again are re-skipped by the scheduler instead of being left behind permanently.
+- `resume --resume-failed` now also accepts completed runs with a `partial` outcome, re-running only the failed/skipped tasks while reusing succeeded results; previously such runs were terminal and could only be re-planned from scratch. The `resume_requested` event records the originating run status as `from_status`. Completed runs with a `success` outcome remain a resume noop.
+- The CLI no longer coerces digit-only values of string flags into numbers, so `plan --run-id 123` (and numeric `--objective`, `--reason`, `--approved-by` values) work instead of failing with a raw TypeError. Only `--max-tasks`, `--since-offset`, and `--limit` are parsed as numbers, and boolean flags reject values other than `true`/`false`. `planWorkflow` additionally rejects non-string `runId` values defensively.
+
+### Changed
+
+- SKILL.md's recovery section and the MCP resume tool description document resuming partial completed runs and the skipped-task requeue behavior.
+
 ## v0.2.0 - 2026-06-10
 
 ### Added

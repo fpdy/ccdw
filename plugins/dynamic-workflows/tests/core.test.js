@@ -522,6 +522,111 @@ test("resume --resume-failed retries failed tasks and completes", async () => {
   });
 });
 
+function skipChainSpec() {
+  // t2 is skipped when its blocker t1 fails; t3 sits in a fail phase so the
+  // whole run fails while a skipped task exists.
+  return codexSpec({
+    phases: [
+      { phase_id: "p1", tasks: ["t1", "t2"], on_failure: "continue" },
+      { phase_id: "p2", tasks: ["t3"], on_failure: "fail" },
+    ],
+    tasks: [
+      { task_id: "t1", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "one" },
+      { task_id: "t2", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "two", depends_on: ["t1"] },
+      { task_id: "t3", phase_id: "p2", kind: "codex_agent", role: "w", prompt_template: "three" },
+    ],
+    max_concurrency: 1,
+  });
+}
+
+test("resume --resume-failed requeues skipped tasks once their blocker recovers", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: skipChainSpec() });
+
+  const failed = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_RESULT_STATUS: "failed" },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.tasks.t1.status, "failed");
+  assert.equal(failed.tasks.t2.status, "skipped");
+  assert.equal(failed.tasks.t3.status, "failed");
+
+  const resumed = await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin }, () =>
+    resumeWorkflow({ runDir: planned.run_dir, resumeFailed: true }),
+  );
+  assert.equal(resumed.status, "completed");
+  assert.equal(resumed.outcome.status, "success");
+  assert.equal(resumed.tasks.t1.status, "succeeded");
+  assert.equal(resumed.tasks.t2.status, "succeeded");
+  assert.equal(resumed.tasks.t3.status, "succeeded");
+});
+
+test("resume --resume-failed re-skips tasks whose blocker fails again", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: skipChainSpec() });
+
+  await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_RESULT_STATUS: "failed" }, async () => {
+    const failed = await runWorkflow({ runDir: planned.run_dir, approve: true });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.tasks.t2.status, "skipped");
+
+    const resumed = await resumeWorkflow({ runDir: planned.run_dir, resumeFailed: true });
+    assert.equal(resumed.status, "failed");
+    assert.equal(resumed.tasks.t1.status, "failed");
+    assert.equal(resumed.tasks.t2.status, "skipped");
+  });
+});
+
+test("resume --resume-failed recovers a completed run with a partial outcome", async () => {
+  const workspace = makeTempWorkspace();
+  const marker = path.join(workspace, "fail-once.marker");
+  const planned = planWorkflow({
+    workspace,
+    spec: codexSpec({
+      phases: [{ phase_id: "p1", tasks: ["t1", "t2"], on_failure: "continue" }],
+      tasks: [
+        { task_id: "t1", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "one" },
+        { task_id: "t2", phase_id: "p1", kind: "codex_agent", role: "w", prompt_template: "two", depends_on: ["t1"] },
+      ],
+      max_concurrency: 1,
+    }),
+  });
+
+  await withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_FAIL_MARKER: marker }, async () => {
+    const partial = await runWorkflow({ runDir: planned.run_dir, approve: true });
+    assert.equal(partial.status, "completed");
+    assert.equal(partial.outcome.status, "partial");
+    assert.equal(partial.tasks.t1.status, "failed");
+    assert.equal(partial.tasks.t2.status, "skipped");
+
+    const resumed = await resumeWorkflow({ runDir: planned.run_dir, resumeFailed: true });
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.outcome.status, "success");
+    assert.equal(resumed.tasks.t1.status, "succeeded");
+    assert.equal(resumed.tasks.t2.status, "succeeded");
+  });
+
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  const resumeEvent = events.find((event) => event.type === "resume_requested");
+  assert.equal(resumeEvent.payload.from_status, "completed");
+  assert.equal(resumeEvent.payload.resume_failed, true);
+});
+
+test("resume --resume-failed stays a noop for completed runs with a success outcome", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ objective: "Fully successful run", workspace });
+  const completed = await runWorkflow({ runDir: planned.run_dir, approve: true });
+  assert.equal(completed.outcome.status, "success");
+
+  const resumed = await resumeWorkflow({ runDir: planned.run_dir, resumeFailed: true });
+  assert.equal(resumed.status, "completed");
+  assert.equal(resumed.outcome.status, "success");
+
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  assert.ok(events.some((event) => event.type === "resume_noop"));
+});
+
 test("token budget is enforced fail-closed between launches", async () => {
   const workspace = makeTempWorkspace();
   const planned = planWorkflow({
@@ -713,6 +818,38 @@ test("CLI plan accepts a caller-authored spec file", () => {
   );
   assert.equal(completed.status, "completed");
   assert.equal(completed.tasks.solo.status, "succeeded");
+});
+
+test("CLI keeps digit-only string arguments as strings", () => {
+  const workspace = makeTempWorkspace();
+  const cli = path.join(pluginRoot, "scripts", "dynamic-workflows.js");
+  const planned = JSON.parse(
+    execFileSync(
+      "node",
+      [cli, "plan", "--objective", "Numeric run id", "--workspace", workspace, "--run-id", "123", "--json"],
+      { encoding: "utf8" },
+    ),
+  );
+
+  assert.equal(planned.run_id, "123");
+  assert.equal(path.basename(planned.run_dir), "123");
+});
+
+test("CLI rejects non-numeric values for numeric flags via core validation", () => {
+  const workspace = makeTempWorkspace();
+  const cli = path.join(pluginRoot, "scripts", "dynamic-workflows.js");
+  const planned = planWorkflow({ objective: "Invalid maxTasks over the CLI", workspace });
+
+  assert.throws(
+    () =>
+      execFileSync(
+        "node",
+        [cli, "run", "--run-dir", planned.run_dir, "--approve", "--max-tasks", "abc", "--json"],
+        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] },
+      ),
+    (error) => /maxTasks/.test(error.stderr),
+  );
+  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
 });
 
 test("validatePluginLayout sees the expected plugin files", () => {
