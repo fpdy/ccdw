@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.5.0 - 2026-06-12
+
+### Changed (breaking for new plans)
+
+- Added explicit task-level executor fields. `model` is supported for codex and
+  claude tasks, `profile` is codex-only, and `effort` is claude-only with
+  values `low`, `medium`, `high`, `xhigh`, or `max`. New plans reject
+  unsupported executor/field combinations, invalid model/profile strings, and
+  executor fields on local tasks; rejection messages for codex `effort` point
+  to `model_reasoning_effort` via a codex profile instead. Approval summaries
+  include these fields when present so consent matches the worker argv.
+- Spawned executor argv now rejects unsafe stored values before worker launch:
+  leading `-`, whitespace, control characters, or values longer than 512
+  characters. This can cause pre-v0.5.0 stored runs with unsafe `model`,
+  `profile`, or `effort` values to fail before spawning the worker; local tasks
+  remain unaffected.
+
+### Fixed
+
+- Approval, run, resume, and detached startup now verify the stored spec hash
+  before execution-sensitive mutations. The workflow bytes are read once,
+  hashed, and parsed from the same bytes, preventing an approved run from
+  executing a swapped `workflow.yaml`.
+- `run --approve` validates the spec before writing the approval event, and
+  detached startup validates before writing `runner.log` or spawning the
+  background runner. Completed/tampered runs now fail integrity checks before
+  `run_noop` / `resume_noop` events are appended.
+- Claude attempts record resolved model telemetry as `models_used` arrays from
+  raw `modelUsage` result events, with raw stream events retained in
+  `claude-events.jsonl`.
+
+### Documentation
+
+- README, SKILL.md, MCP tool descriptions, and `workflow.schema.json` document
+  `model`, `profile`, `effort`, task `timeout_ms`, and the executor-family
+  field contract. `README.ja.md` is synced with the executor-field and
+  spec-hash verification paragraphs.
+
 ## v0.4.0 - 2026-06-11
 
 ### Added

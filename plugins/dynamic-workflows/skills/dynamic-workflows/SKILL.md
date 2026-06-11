@@ -36,6 +36,14 @@ them — such environments must export `ANTHROPIC_API_KEY` to the orchestrator's
 environment — and the user-level `model` setting does not apply either, so set
 a task-level `model` if you need a specific one.
 
+Task-level executor fields are strict for new plans: `model` works for codex
+and claude tasks, `profile` works only for codex tasks, `effort` works only for
+claude tasks (`low`, `medium`, `high`, `xhigh`, `max`), and local tasks must
+not carry any of them. New-plan `model` and `profile` values must match
+`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$`; stored-run spawned executor values are
+also guarded at argv build time against leading `-`, whitespace/control
+characters, and values over 512 characters.
+
 ## Planning the spec
 
 Write a WorkflowSpec JSON file yourself. Decompose into phases (DAG via
@@ -84,6 +92,10 @@ Rules for good specs:
   kinds starting with `claude` (e.g. `claude_agent`) run as `claude -p`
   subagents; `local_*` kinds are deterministic no-LLM steps. Workers run
   read-only unless `workspace_policy.write_scope` includes `"workspace"`.
+- Use task-level `model` only when you need to pin the worker model. Use
+  codex `profile` only for codex CLI profiles; explicit task `model` remains
+  visible in argv and wins over profile model settings. Use claude `effort`
+  only for claude tasks.
 - The runner rejects `workspace_policy.shell:true` and `mcp_write:true`; the
   approval summary reports the actually enforced worker sandbox and network
   access instead. `workspace_policy.network:true` is rejected at plan time for
@@ -118,7 +130,8 @@ Validate without side effects first: `plan --spec-file spec.json --dry-run --jso
 ## Approval
 
 1. `plan --spec-file <file> --workspace <repo-root> --json` returns
-   `approval.summary` (phases, per-task prompts, enforced sandbox, budget, spec hash).
+   `approval.summary` (phases, per-task prompts, optional model/effort/profile,
+   enforced sandbox, budget, spec hash).
 2. Render that summary to the user as a short bulleted plan and ask for
    consent. Never self-approve. Never auto-approve any spec that requests
    workspace write or network access beyond what the user explicitly accepted.

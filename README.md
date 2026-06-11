@@ -69,6 +69,12 @@ Three executors are built in:
 - **local executor**: deterministic `local_*` task kinds used by the default
   template and the test suite; no LLM sessions are spawned.
 
+Task-level `model` is supported for codex and claude tasks. `profile` is
+codex-only, `effort` is claude-only (`low`, `medium`, `high`, `xhigh`, `max`),
+and local tasks reject all executor fields in new plans. Approval summaries
+include these fields when present, and spawned executors reject argv-unsafe
+stored values before launch.
+
 The scheduler is a ready-queue over the phase/task DAG: tasks run as soon as
 their dependencies succeed, up to `max_concurrency`, and the run fails closed
 when `max_tokens`, `max_duration_ms`, or `max_agents` is exceeded. Retry
@@ -83,6 +89,10 @@ with a read-only sandbox unless `workspace_policy.write_scope` includes
 workspace-write mode. The runner rejects `workspace_policy.shell:true` and
 `workspace_policy.mcp_write:true` because those permissions are not enforced by
 the current worker invocations.
+
+Approval, run, resume, and detached startup verify the stored workflow spec hash
+before execution-sensitive mutations, so an approved run cannot execute a
+swapped `workflow.yaml`.
 
 ## Requirements
 

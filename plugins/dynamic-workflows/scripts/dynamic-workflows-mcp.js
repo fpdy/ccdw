@@ -15,14 +15,14 @@ import fs from "node:fs";
 
 const serverInfo = {
   name: "dynamic-workflows",
-  version: "0.4.0",
+  version: "0.5.0",
 };
 
 const tools = [
   {
     name: "dynamic_workflows_plan",
     description:
-      "Validate and register a workflow run, leaving it awaiting approval. Pass `spec` (a WorkflowSpec JSON object you author: phases[], tasks[] with self-contained prompt_template per task, depends_on, budgets) to run your own plan; tasks with kind starting with \"codex\" execute as real codex exec subagents and kinds starting with \"claude\" as claude -p subagents. Without `spec`, a fixed local explore/verify/synthesize template is planned (a smoke-test scaffold, not a real decomposition). Set dryRun:true to validate a spec without creating a run. This tool never overwrites an existing runId; replacing a non-running run requires the CLI's `plan --force`. Returns the approval summary (including advisory_fields, the spec fields the runner records but does not enforce); render it to the user before approving.",
+      "Validate and register a workflow run, leaving it awaiting approval. Pass `spec` (a WorkflowSpec JSON object you author: phases[], tasks[] with self-contained prompt_template per task, depends_on, budgets) to run your own plan; tasks with kind starting with \"codex\" execute as real codex exec subagents, kinds starting with \"claude\" as claude -p subagents, and other kinds as deterministic local tasks. Task-level `model` applies to codex and claude, `profile` applies only to codex, and `effort` applies only to claude; unsupported combinations are rejected for new plans and shown in the approval summary when present. Without `spec`, a fixed local explore/verify/synthesize template is planned (a smoke-test scaffold, not a real decomposition). Set dryRun:true to validate a spec without creating a run. This tool never overwrites an existing runId; replacing a non-running run requires the CLI's `plan --force`. Returns the approval summary (including advisory_fields, the spec fields the runner records but does not enforce); render it to the user before approving.",
     inputSchema: {
       type: "object",
       properties: {

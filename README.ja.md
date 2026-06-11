@@ -69,6 +69,12 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
 - **ローカル実行**: `local_*` のタスク種別は毎回同じ結果になる手元の実行処理で、
   既定テンプレートとテスト一式が使います。LLMセッションは起動しません。
 
+タスクレベルの `model` はcodexタスクとclaudeタスクで対応しています。`profile` はcodex専用、
+`effort` はclaude専用 (`low`、`medium`、`high`、`xhigh`、`max`) で、ローカルタスクは
+新しい計画で実行処理フィールドをすべて拒否します。承認サマリには、これらのフィールドが
+指定されている場合にその値が表示されます。argvとして安全でない格納値は、
+workerの起動前に実行処理が拒否します。
+
 スケジューラはフェーズ/タスクDAG上のready-queueです。依存が満たされたタスクから
 `max_concurrency` まで並列に実行し、`max_tokens`、`max_duration_ms`、
 `max_agents` を超えたら安全側で停止します。タスク単位の再試行ポリシー
@@ -83,6 +89,10 @@ Workflowの `phase_id` と `task_id` は
 実行されます。networkはcodexタスクのworkspace-writeモードでのみ対応します。
 `workspace_policy.shell:true` と `workspace_policy.mcp_write:true` は、現在の
 worker起動では強制できないため実行側が拒否します。
+
+承認、実行、再開、バックグラウンド起動では、実行に影響する状態変更の前に格納済みの
+作業手順仕様ハッシュを検証するため、承認済みの実行で差し替えた `workflow.yaml` が
+実行されることはありません。
 
 ## 必要環境
 

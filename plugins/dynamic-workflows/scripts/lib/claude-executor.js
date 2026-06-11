@@ -1,3 +1,4 @@
+import { CLAUDE_EFFORT_LEVELS, pushSafeWorkerArg } from "./executor-contract.js";
 import { startNdjsonProcess } from "./process-runner.js";
 import { WORKER_OUTPUT_SCHEMA } from "./codex-executor.js";
 
@@ -80,10 +81,15 @@ export function buildClaudeExecArgs({ workflow, task, settingsPath }) {
       "default",
     );
   }
-  if (typeof task.model === "string" && task.model.trim() !== "") {
-    args.push("--model", task.model);
+  pushSafeWorkerArg(args, "--model", task.model, `task ${task.task_id} model`);
+  if (task.effort != null) {
+    if (!CLAUDE_EFFORT_LEVELS.includes(task.effort)) {
+      throw new Error(`task ${task.task_id} effort must be one of ${CLAUDE_EFFORT_LEVELS.join("|")}`);
+    }
+    args.push("--effort", task.effort);
   }
-  // task.profile is codex-only and intentionally ignored for claude workers.
+  // task.profile is codex-only. Stored pre-v0.5.0 runs may carry it, so
+  // runtime keeps ignoring it; new plans reject it in strict validation.
   return args;
 }
 

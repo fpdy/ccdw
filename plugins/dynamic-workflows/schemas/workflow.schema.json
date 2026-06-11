@@ -135,12 +135,51 @@
         "retry_policy": { "$ref": "#/$defs/retryPolicy" },
         "verification_required": { "type": "boolean" },
         "stop_condition": { "const": "budget_or_cancelled" },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "model": { "$ref": "#/$defs/modelValue" },
+        "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+        "profile": { "$ref": "#/$defs/modelValue" },
         "outputs": { "type": "array", "items": { "type": "string" } }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "pattern": "^codex" } },
+            "required": ["kind"]
+          },
+          "then": { "not": { "required": ["effort"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "pattern": "^claude" } },
+            "required": ["kind"]
+          },
+          "then": { "not": { "required": ["profile"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "pattern": "^(?!codex|claude)" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["model"] },
+                { "required": ["effort"] },
+                { "required": ["profile"] }
+              ]
+            }
+          }
+        }
+      ]
     },
     "specId": {
       "type": "string",
       "pattern": "^(?!\\.+$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "modelValue": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$"
     },
     "retryPolicy": {
       "type": "object",

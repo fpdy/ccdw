@@ -17,6 +17,12 @@ import {
   resolveClaudeBin,
   startClaudeExec,
 } from "./claude-executor.js";
+import {
+  CLAUDE_EFFORT_LEVELS,
+  EXECUTOR_FIELD_CONTRACT,
+  MODEL_VALUE_PATTERN,
+  MODEL_VALUE_PATTERN_SOURCE,
+} from "./executor-contract.js";
 
 export const SCHEMA_VERSION = "dynamic-workflows.v1";
 export const CCDW_HOME_ENV = "CCDW_HOME";
@@ -169,7 +175,7 @@ export function planWorkflow(options = {}) {
 export function approveWorkflow(options = {}) {
   const runDir = requireRunDir(options.runDir);
   const state = readRunState(runDir);
-  const workflow = readWorkflowSpec(runDir);
+  const workflow = readVerifiedWorkflowSpec(runDir, state, "approve");
   assertKnownRunState(state, workflow);
 
   if (state.status === "approved" || state.status === "running") {
@@ -183,8 +189,10 @@ export function approveWorkflow(options = {}) {
 
   return withRunLock(runDir, () => {
     const lockedState = readRunState(runDir);
+    const lockedWorkflow = readVerifiedWorkflowSpec(runDir, lockedState, "approve");
+    assertKnownRunState(lockedState, lockedWorkflow);
     if (lockedState.status !== "awaiting_approval" && lockedState.status !== "planned") {
-      return summarizeRun(runDir, lockedState, workflow);
+      return summarizeRun(runDir, lockedState, lockedWorkflow);
     }
     const timestamp = nowIso();
     lockedState.status = "approved";
@@ -193,7 +201,7 @@ export function approveWorkflow(options = {}) {
     recordEvent(runDir, lockedState, "approval_granted", {
       approved_by: lockedState.approval.approved_by,
     });
-    return summarizeRun(runDir, readRunState(runDir), workflow);
+    return summarizeRun(runDir, readRunState(runDir), lockedWorkflow);
   });
 }
 
@@ -201,7 +209,7 @@ export async function runWorkflow(options = {}) {
   const maxTasks = normalizeOptionalMaxTasks(options.maxTasks);
   const runDir = requireRunDir(options.runDir);
   let state = readRunState(runDir);
-  const workflow = readWorkflowSpec(runDir);
+  let workflow = readVerifiedWorkflowSpec(runDir, state, "run");
   assertKnownRunState(state, workflow);
 
   if (state.status === "awaiting_approval" || state.status === "planned") {
@@ -212,15 +220,10 @@ export async function runWorkflow(options = {}) {
     }
     approveWorkflow({ runDir, approvedBy: options.approvedBy });
     state = readRunState(runDir);
+    workflow = readVerifiedWorkflowSpec(runDir, state, "run");
+    assertKnownRunState(state, workflow);
   }
 
-  if (state.status === "completed") {
-    return withRunLock(runDir, () => {
-      const lockedState = readRunState(runDir);
-      recordEvent(runDir, lockedState, "run_noop", { reason: "already_completed" });
-      return summarizeRun(runDir, readRunState(runDir), workflow);
-    });
-  }
   if (state.status === "cancelled") {
     throw new WorkflowError("Cancelled runs cannot be run.", { status: state.status });
   }
@@ -241,11 +244,27 @@ export async function runWorkflow(options = {}) {
     });
   }
   if (state.status !== "approved" && state.status !== "paused") {
-    throw new WorkflowError("Run is not in an executable status.", { status: state.status });
+    if (state.status !== "completed") {
+      throw new WorkflowError("Run is not in an executable status.", { status: state.status });
+    }
   }
 
   const lockPath = acquireRunLock(runDir);
-  state = readRunState(runDir);
+  let earlySummary = null;
+  try {
+    state = readRunState(runDir);
+    workflow = readVerifiedWorkflowSpec(runDir, state, "run");
+    assertKnownRunState(state, workflow);
+    earlySummary = prepareLockedRunStart(runDir, state, workflow);
+  } catch (error) {
+    releaseRunLock(lockPath);
+    throw error;
+  }
+  if (earlySummary) {
+    releaseRunLock(lockPath);
+    return earlySummary;
+  }
+
   try {
     state.runner = {
       pid: process.pid,
@@ -255,7 +274,7 @@ export async function runWorkflow(options = {}) {
     state.status = "running";
     recordEvent(runDir, state, "run_started", {
       workflow_id: workflow.workflow_id,
-    runner_pid: process.pid,
+      runner_pid: process.pid,
     });
     await executeApprovedRun(runDir, workflow, state, { ...options, maxTasks });
   } finally {
@@ -266,11 +285,35 @@ export async function runWorkflow(options = {}) {
   return summarizeRun(runDir, readRunState(runDir), workflow);
 }
 
+function prepareLockedRunStart(runDir, state, workflow) {
+  if (state.status === "completed") {
+    recordEvent(runDir, state, "run_noop", { reason: "already_completed" });
+    return summarizeRun(runDir, readRunState(runDir), workflow);
+  }
+  if (state.status === "cancelled") {
+    throw new WorkflowError("Cancelled runs cannot be run.", { status: state.status });
+  }
+  if (state.status === "failed") {
+    throw new WorkflowError("Failed runs require resume with --resume-failed.", {
+      status: state.status,
+    });
+  }
+  if (state.status === "running") {
+    throw new WorkflowError("Run is marked running but has no live orchestrator. Use resume to recover.", {
+      status: state.status,
+    });
+  }
+  if (state.status !== "approved" && state.status !== "paused") {
+    throw new WorkflowError("Run is not in an executable status.", { status: state.status });
+  }
+  return null;
+}
+
 export async function resumeWorkflow(options = {}) {
   const maxTasks = normalizeOptionalMaxTasks(options.maxTasks);
   const runDir = requireRunDir(options.runDir);
-  const workflow = readWorkflowSpec(runDir);
   let state = readRunState(runDir);
+  let workflow = readVerifiedWorkflowSpec(runDir, state, "resume");
   assertKnownRunState(state, workflow);
 
   const liveLock = readLiveLock(runDir);
@@ -289,16 +332,10 @@ export async function resumeWorkflow(options = {}) {
     return summarizeRun(runDir, readRunState(runDir), workflow);
   }
 
-  const currentHash = hashFile(path.join(runDir, WORKFLOW_FILE));
-  if (typeof state.spec_hash === "string" && state.spec_hash !== currentHash) {
-    throw new WorkflowError("Workflow spec changed since plan; refusing to resume.", {
-      planned_hash: state.spec_hash,
-      current_hash: currentHash,
-    });
-  }
-
   withRunLock(runDir, () => {
     state = readRunState(runDir);
+    workflow = readVerifiedWorkflowSpec(runDir, state, "resume");
+    assertKnownRunState(state, workflow);
     const fromStatus = state.status;
     const timestamp = nowIso();
     for (const [attemptId, attempt] of Object.entries(state.attempts ?? {})) {
@@ -513,6 +550,8 @@ export async function detachWorkflowRun(options = {}) {
     });
   }
   const preState = readRunState(runDir);
+  const workflow = readVerifiedWorkflowSpec(runDir, preState, "detach");
+  assertKnownRunState(preState, workflow);
   if ((preState.status === "awaiting_approval" || preState.status === "planned") && !options.approve) {
     throw new WorkflowError("Run is awaiting approval. Approve first or pass approve.", {
       status: preState.status,
@@ -569,7 +608,6 @@ export async function detachWorkflowRun(options = {}) {
     });
   }
   const state = readRunState(runDir);
-  const workflow = readWorkflowSpec(runDir);
   return {
     ...summarizeRun(runDir, state, workflow),
     detached: true,
@@ -603,6 +641,7 @@ export function validatePluginLayout(options = {}) {
     "scripts/dynamic-workflows-mcp.js",
     "scripts/lib/codex-executor.js",
     "scripts/lib/claude-executor.js",
+    "scripts/lib/executor-contract.js",
     "scripts/lib/process-runner.js",
     "schemas/workflow.schema.json",
     "schemas/run-state.schema.json",
@@ -618,6 +657,20 @@ export function validatePluginLayout(options = {}) {
 
 export function readWorkflowSpec(runDir) {
   return readJson(path.join(runDir, WORKFLOW_FILE));
+}
+
+export function readVerifiedWorkflowSpec(runDir, state, action = "read") {
+  const specPath = path.join(runDir, WORKFLOW_FILE);
+  const bytes = fs.readFileSync(specPath);
+  const currentHash = hashBytes(bytes);
+  if (typeof state?.spec_hash === "string" && state.spec_hash !== currentHash) {
+    throw new WorkflowError("Workflow spec changed since plan; refusing to continue.", {
+      action,
+      planned_hash: state.spec_hash,
+      current_hash: currentHash,
+    });
+  }
+  return JSON.parse(bytes.toString("utf8"));
 }
 
 export function readRunState(runDir) {
@@ -685,6 +738,7 @@ export function applySpecDefaults(spec, { objective, workspace, runId, workflowI
         outputs: task.outputs ?? ["result.json"],
         ...(task.timeout_ms != null ? { timeout_ms: task.timeout_ms } : {}),
         ...(task.model != null ? { model: task.model } : {}),
+        ...(task.effort != null ? { effort: task.effort } : {}),
         ...(task.profile != null ? { profile: task.profile } : {}),
       };
     });
@@ -837,6 +891,7 @@ export function validateWorkflowSpec(workflow, options = {}) {
         );
       }
       validateInputSource(task, errors);
+      validateTaskExecutorFields(task, errors);
     }
     if (taskIds.has(task.task_id)) {
       errors.push(`duplicate task_id: ${task.task_id}`);
@@ -1383,17 +1438,17 @@ function quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, atte
 
 async function runCodexAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext) {
   const schemaPath = path.join(runDir, WORKER_SCHEMA_FILE);
-  if (!fs.existsSync(schemaPath)) {
-    writeJson(schemaPath, WORKER_OUTPUT_SCHEMA);
-  }
   const lastMessagePath = path.join(attemptDir, "last-message.txt");
   const workerEventsPath = path.join(attemptDir, "codex-events.jsonl");
-  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
-  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
   const remainingMs = workflow.max_duration_ms - (Date.now() - runStartedAt);
   const timeoutMs = Math.max(Math.min(task.timeout_ms ?? Infinity, remainingMs), 1000);
   const bin = resolveCodexBin();
   const args = buildCodexExecArgs({ workflow, task, lastMessagePath, schemaPath });
+  if (!fs.existsSync(schemaPath)) {
+    writeJson(schemaPath, WORKER_OUTPUT_SCHEMA);
+  }
+  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
+  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
 
   const attempt = state.attempts[attemptId];
   attempt.status = "running";
@@ -1537,16 +1592,16 @@ async function runCodexAttempt(runDir, workflow, state, task, attemptId, attempt
 
 async function runClaudeAttempt(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext) {
   const settingsPath = path.join(runDir, CLAUDE_SETTINGS_FILE);
-  if (!fs.existsSync(settingsPath)) {
-    writeJson(settingsPath, buildClaudeSandboxSettings({ workflow }));
-  }
   const workerEventsPath = path.join(attemptDir, "claude-events.jsonl");
-  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
-  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
   const remainingMs = workflow.max_duration_ms - (Date.now() - runStartedAt);
   const timeoutMs = Math.max(Math.min(task.timeout_ms ?? Infinity, remainingMs), 1000);
   const bin = resolveClaudeBin();
   const args = buildClaudeExecArgs({ workflow, task, settingsPath });
+  if (!fs.existsSync(settingsPath)) {
+    writeJson(settingsPath, buildClaudeSandboxSettings({ workflow }));
+  }
+  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
+  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths });
 
   const attempt = state.attempts[attemptId];
   attempt.status = "running";
@@ -1569,11 +1624,16 @@ async function runClaudeAttempt(runDir, workflow, state, task, attemptId, attemp
         return;
       }
       if (event.type === "system" && event.subtype === "init" && typeof event.session_id === "string") {
+        const model = typeof event.model === "string" && event.model.trim() !== "" ? event.model : null;
         attempt.thread_id = event.session_id;
+        if (model) {
+          attempt.models_used = [model];
+        }
         recordEvent(runDir, state, "worker_thread_started", {
           task_id: task.task_id,
           attempt_id: attemptId,
           thread_id: event.session_id,
+          ...(model ? { model } : {}),
         });
       }
       if (event.type === "result" && !resultAccounted) {
@@ -1594,10 +1654,15 @@ async function runClaudeAttempt(runDir, workflow, state, task, attemptId, attemp
           (Number(usage.output_tokens) || 0) +
           (Number(usage.reasoning_output_tokens) || 0);
         state.budget_usage.tokens += tokens;
+        const modelsUsed = sortedModelUsageKeys(event.modelUsage);
+        if (modelsUsed.length > 0) {
+          attempt.models_used = modelsUsed;
+        }
         recordEvent(runDir, state, "progress", {
           task_id: task.task_id,
           attempt_id: attemptId,
           token_usage: usage,
+          ...(modelsUsed.length > 0 ? { models_used: modelsUsed } : {}),
           last_activity_at: nowIso(),
         });
       }
@@ -1823,6 +1888,13 @@ function resolveTaskInputs(runDir, workflow, state, task) {
   return resolved;
 }
 
+function sortedModelUsageKeys(modelUsage) {
+  if (!isPlainObject(modelUsage)) {
+    return [];
+  }
+  return [...new Set(Object.keys(modelUsage).filter((key) => key.trim() !== ""))].sort();
+}
+
 // --- Default template ------------------------------------------------------
 
 function buildDefaultWorkflowSpec({ objective, workspace, runId, workflowId, createdAt }) {
@@ -1985,6 +2057,21 @@ function buildExecutionSandboxSummary(workflow, policy) {
   return summary;
 }
 
+function buildApprovalTaskSummary(task) {
+  return {
+    task_id: task.task_id,
+    role: task.role,
+    kind: task.kind,
+    ...(task.model != null ? { model: task.model } : {}),
+    ...(task.effort != null ? { effort: task.effort } : {}),
+    ...(task.profile != null ? { profile: task.profile } : {}),
+    prompt_summary:
+      task.prompt_template.length > 120
+        ? `${task.prompt_template.slice(0, 117)}...`
+        : task.prompt_template,
+  };
+}
+
 function buildInitialRunState({ workflow, goalId, createdAt, specHash }) {
   const tasks = {};
   for (const task of workflow.tasks) {
@@ -2040,15 +2127,7 @@ function buildInitialRunState({ workflow, goalId, createdAt, specHash }) {
           name: phase.name,
           task_count: phase.tasks.length,
         })),
-        tasks: workflow.tasks.map((task) => ({
-          task_id: task.task_id,
-          role: task.role,
-          kind: task.kind,
-          prompt_summary:
-            task.prompt_template.length > 120
-              ? `${task.prompt_template.slice(0, 117)}...`
-              : task.prompt_template,
-        })),
+        tasks: workflow.tasks.map((task) => buildApprovalTaskSummary(task)),
         max_agents: workflow.max_agents,
         max_concurrency: workflow.max_concurrency,
         requested_capabilities: workflow.required_capabilities,
@@ -2483,6 +2562,48 @@ function validateSpecId(value, label, errors) {
   }
 }
 
+function validateTaskExecutorFields(task, errors) {
+  const executorKind = resolveExecutorKind(task.kind);
+  validateExecutorStringField(task, "model", executorKind, errors);
+  validateExecutorStringField(task, "profile", executorKind, errors);
+  validateExecutorEffortField(task, executorKind, errors);
+}
+
+function validateExecutorStringField(task, field, executorKind, errors) {
+  const value = task[field];
+  if (value == null) {
+    return;
+  }
+  if (EXECUTOR_FIELD_CONTRACT[field]?.[executorKind] !== true) {
+    errors.push(`task ${task.task_id} ${field} is not supported for ${executorKind} tasks`);
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push(`task ${task.task_id} ${field} must be a non-empty string`);
+    return;
+  }
+  if (!MODEL_VALUE_PATTERN.test(value)) {
+    errors.push(`task ${task.task_id} ${field} must match ${MODEL_VALUE_PATTERN_SOURCE}`);
+  }
+}
+
+function validateExecutorEffortField(task, executorKind, errors) {
+  const value = task.effort;
+  if (value == null) {
+    return;
+  }
+  if (EXECUTOR_FIELD_CONTRACT.effort?.[executorKind] !== true) {
+    const guidance = executorKind === "codex" ? " (set model_reasoning_effort via a codex profile instead)" : "";
+    errors.push(`task ${task.task_id} effort is not supported for ${executorKind} tasks${guidance}`);
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push(`task ${task.task_id} effort must be a non-empty string`);
+    return;
+  }
+  if (!CLAUDE_EFFORT_LEVELS.includes(value)) {
+    errors.push(`task ${task.task_id} effort must be one of: ${CLAUDE_EFFORT_LEVELS.join(", ")}`);
+  }
+}
+
 function validateInputSource(task, errors) {
   const source = task.input_source;
   if (source == null || source === "objective" || source === "accepted_worker_results") {
@@ -2685,7 +2806,11 @@ function toRunRelative(runDir, file) {
 }
 
 function hashFile(file) {
-  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  return hashBytes(fs.readFileSync(file));
+}
+
+function hashBytes(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 function libDirectory() {

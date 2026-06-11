@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  approveWorkflow,
   cancelWorkflow,
   detachWorkflowRun,
   listWorkflowRuns,
@@ -104,6 +106,42 @@ async function pollUntil(predicate, { timeoutMs = 10000, intervalMs = 50 } = {})
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   return false;
+}
+
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function writeJsonFile(filePath, value) {
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function hashFileForTest(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function mutateWorkflowFile(runDir, mutator) {
+  const specPath = path.join(runDir, "workflow.yaml");
+  const spec = readJsonFile(specPath);
+  mutator(spec);
+  writeJsonFile(specPath, spec);
+  return spec;
+}
+
+function refreshStoredSpecHash(runDir) {
+  const statePath = path.join(runDir, "run.json");
+  const state = readJsonFile(statePath);
+  state.spec_hash = hashFileForTest(path.join(runDir, "workflow.yaml"));
+  writeJsonFile(statePath, state);
+}
+
+function workflowEventTypes(runDir) {
+  return readWorkflowEvents({ runDir }).events.map((event) => event.type);
+}
+
+function artifactDirForTask(runDir, state, taskId) {
+  const attemptId = state.tasks[taskId].attempts[0];
+  return path.join(runDir, state.attempts[attemptId].artifact_dir);
 }
 
 test("planWorkflow creates an approval-gated run directory", () => {
@@ -1289,7 +1327,14 @@ import {
   buildClaudeSandboxSettings,
   resolveClaudeBin,
 } from "../scripts/lib/claude-executor.js";
-import { WORKER_OUTPUT_SCHEMA } from "../scripts/lib/codex-executor.js";
+import { buildCodexExecArgs, WORKER_OUTPUT_SCHEMA } from "../scripts/lib/codex-executor.js";
+import {
+  CLAUDE_EFFORT_LEVELS,
+  EXECUTOR_FIELD_CONTRACT,
+  EXECUTOR_KIND_MATCHERS,
+  MODEL_VALUE_PATTERN_SOURCE,
+  pushSafeWorkerArg,
+} from "../scripts/lib/executor-contract.js";
 
 const fakeClaudeBin = path.join(pluginRoot, "tests", "fixtures", "fake-claude.js");
 
@@ -1327,6 +1372,523 @@ function flagValueIn(args, flag) {
   const index = args.indexOf(flag);
   return index === -1 ? undefined : args[index + 1];
 }
+
+function singleLocalTaskSpec(taskOverrides = {}, specOverrides = {}) {
+  return codexSpec({
+    objective: "Exercise the local executor",
+    phases: [{ phase_id: "p1", tasks: ["t1"] }],
+    tasks: [
+      {
+        task_id: "t1",
+        phase_id: "p1",
+        kind: "local_analysis",
+        role: "tester",
+        prompt_template: "Run task one.",
+        ...taskOverrides,
+      },
+    ],
+    ...specOverrides,
+  });
+}
+
+test("executor field contract rejects unsupported and malformed new plans", () => {
+  const workspace = makeTempWorkspace();
+  const cases = [
+    {
+      name: "codex effort",
+      spec: singleCodexTaskSpec({ effort: "high" }),
+      message: "effort is not supported for codex tasks",
+    },
+    {
+      name: "claude profile",
+      spec: singleClaudeTaskSpec({ profile: "locked" }),
+      message: "profile is not supported for claude tasks",
+    },
+    {
+      name: "claude effort enum",
+      spec: singleClaudeTaskSpec({ effort: "extreme" }),
+      message: "effort must be one of",
+    },
+    {
+      name: "codex malformed model",
+      spec: singleCodexTaskSpec({ model: "gpt 5" }),
+      message: "model must match",
+    },
+    {
+      name: "codex hostile profile",
+      spec: singleCodexTaskSpec({ profile: "-hostile" }),
+      message: "profile must match",
+    },
+    {
+      name: "local model",
+      spec: singleLocalTaskSpec({ model: "gpt-5" }),
+      message: "model is not supported for local tasks",
+    },
+    {
+      name: "local effort",
+      spec: singleLocalTaskSpec({ effort: "low" }),
+      message: "effort is not supported for local tasks",
+    },
+    {
+      name: "local profile",
+      spec: singleLocalTaskSpec({ profile: "p1" }),
+      message: "profile is not supported for local tasks",
+    },
+  ];
+
+  for (const entry of cases) {
+    const result = planWorkflow({ workspace, dryRun: true, spec: entry.spec });
+    assert.equal(result.valid, false, entry.name);
+    assert.ok(
+      result.errors.some((message) => message.includes(entry.message)),
+      `${entry.name}: ${result.errors.join("\n")}`,
+    );
+  }
+});
+
+test("executor fields are summarized only for tasks that declare them", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({
+    workspace,
+    spec: codexSpec({
+      objective: "Summarize executor fields",
+      phases: [{ phase_id: "p1", tasks: ["cx", "cl", "lo"] }],
+      tasks: [
+        {
+          task_id: "cx",
+          phase_id: "p1",
+          kind: "codex_agent",
+          role: "w",
+          prompt_template: "codex",
+          model: "gpt-5.1",
+          profile: "locked/profile",
+        },
+        {
+          task_id: "cl",
+          phase_id: "p1",
+          kind: "claude_agent",
+          role: "w",
+          prompt_template: "claude",
+          model: "claude-sonnet-4-5",
+          effort: "max",
+        },
+        {
+          task_id: "lo",
+          phase_id: "p1",
+          kind: "local_analysis",
+          role: "w",
+          prompt_template: "local",
+        },
+      ],
+    }),
+  });
+
+  const tasks = Object.fromEntries(planned.approval.summary.tasks.map((task) => [task.task_id, task]));
+  assert.equal(tasks.cx.model, "gpt-5.1");
+  assert.equal(tasks.cx.profile, "locked/profile");
+  assert.equal(tasks.cx.effort, undefined);
+  assert.equal(tasks.cl.model, "claude-sonnet-4-5");
+  assert.equal(tasks.cl.effort, "max");
+  assert.equal(tasks.cl.profile, undefined);
+  assert.equal(tasks.lo.model, undefined);
+  assert.equal(tasks.lo.effort, undefined);
+  assert.equal(tasks.lo.profile, undefined);
+});
+
+test("approval summary task entries have exactly the base key-set when no executor fields are declared", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+
+  for (const entry of planned.approval.summary.tasks) {
+    assert.deepStrictEqual(Object.keys(entry), ["task_id", "role", "kind", "prompt_summary"]);
+  }
+});
+
+test("stored executor fields stay lenient for observability and validation", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.tasks[0].effort = "high";
+  });
+
+  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
+  assert.equal(validateRunDirectory({ runDir: planned.run_dir }).valid, true);
+});
+
+test("hash-only spec tamper is still observable and cancellable", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.objective = "Changed after plan";
+  });
+
+  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
+  const cancelled = cancelWorkflow({ runDir: planned.run_dir, reason: "stop tampered run" });
+  assert.equal(cancelled.status, "cancelled");
+});
+
+test("approval refuses tampered specs without mutating approval state", () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.objective = "Changed before approval";
+  });
+
+  assert.throws(() => approveWorkflow({ runDir: planned.run_dir }), /Workflow spec changed/);
+  assert.equal(readRunState(planned.run_dir).status, "awaiting_approval");
+  assert.ok(!workflowEventTypes(planned.run_dir).includes("approval_granted"));
+});
+
+test("run --approve refuses tampered specs before approval or run events", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.objective = "Changed before run approve";
+  });
+
+  await assert.rejects(() => runWorkflow({ runDir: planned.run_dir, approve: true }), /Workflow spec changed/);
+  assert.equal(readRunState(planned.run_dir).status, "awaiting_approval");
+  const eventTypes = workflowEventTypes(planned.run_dir);
+  assert.ok(!eventTypes.includes("approval_granted"));
+  assert.ok(!eventTypes.includes("run_started"));
+});
+
+test("approved-then-tampered run rejection leaves no lock or corrupted state behind", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+  approveWorkflow({ runDir: planned.run_dir });
+  const statusAfterApproval = readRunState(planned.run_dir).status;
+
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.objective = "Tampered after approval";
+  });
+
+  await assert.rejects(() => runWorkflow({ runDir: planned.run_dir }), /Workflow spec changed since plan/);
+  assert.ok(!workflowEventTypes(planned.run_dir).includes("run_started"));
+  assert.ok(!fs.existsSync(path.join(planned.run_dir, "orchestrator.lock")));
+  assert.equal(readRunState(planned.run_dir).status, statusAfterApproval);
+
+  refreshStoredSpecHash(planned.run_dir);
+  const recovered = await runWorkflow({ runDir: planned.run_dir });
+  assert.equal(recovered.status, "completed");
+});
+
+test("terminal run and resume noops are behind the L2 spec guard", async () => {
+  const workspace = makeTempWorkspace();
+  const runPlanned = planWorkflow({ workspace, runId: "run-noop-tamper", spec: singleLocalTaskSpec() });
+  await runWorkflow({ runDir: runPlanned.run_dir, approve: true });
+  const runEventCount = readWorkflowEvents({ runDir: runPlanned.run_dir }).events.length;
+  mutateWorkflowFile(runPlanned.run_dir, (spec) => {
+    spec.objective = "Changed before completed run noop";
+  });
+
+  await assert.rejects(() => runWorkflow({ runDir: runPlanned.run_dir }), /Workflow spec changed/);
+  assert.equal(readWorkflowEvents({ runDir: runPlanned.run_dir }).events.length, runEventCount);
+  assert.ok(!workflowEventTypes(runPlanned.run_dir).includes("run_noop"));
+
+  const resumePlanned = planWorkflow({ workspace, runId: "resume-noop-tamper", spec: singleLocalTaskSpec() });
+  await runWorkflow({ runDir: resumePlanned.run_dir, approve: true });
+  const resumeEventCount = readWorkflowEvents({ runDir: resumePlanned.run_dir }).events.length;
+  mutateWorkflowFile(resumePlanned.run_dir, (spec) => {
+    spec.objective = "Changed before resume noop";
+  });
+
+  await assert.rejects(() => resumeWorkflow({ runDir: resumePlanned.run_dir }), /Workflow spec changed/);
+  assert.equal(readWorkflowEvents({ runDir: resumePlanned.run_dir }).events.length, resumeEventCount);
+  assert.ok(!workflowEventTypes(resumePlanned.run_dir).includes("resume_noop"));
+});
+
+test("detach refuses tampered specs before runner log or child spawn", async () => {
+  const workspace = makeTempWorkspace();
+  const planned = planWorkflow({ workspace, spec: singleLocalTaskSpec() });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.objective = "Changed before detach";
+  });
+
+  await assert.rejects(() => detachWorkflowRun({ runDir: planned.run_dir, approve: true }), /Workflow spec changed/);
+  assert.ok(!fs.existsSync(path.join(planned.run_dir, "runner.log")));
+  assert.ok(!workflowEventTypes(planned.run_dir).includes("approval_granted"));
+});
+
+test("pushSafeWorkerArg skips blank legacy values and rejects argv-unsafe classes", () => {
+  const args = [];
+  assert.equal(pushSafeWorkerArg(args, "--model", undefined, "model"), false);
+  assert.equal(pushSafeWorkerArg(args, "--model", "", "model"), false);
+  assert.equal(pushSafeWorkerArg(args, "--model", "   ", "model"), false);
+  assert.deepEqual(args, []);
+
+  assert.equal(pushSafeWorkerArg(args, "--model", "gpt-5.1", "model"), true);
+  assert.deepEqual(args, ["--model", "gpt-5.1"]);
+
+  for (const value of ["-gpt-5", "gpt 5", "gpt\n5", "\x7fbad", "a".repeat(513)]) {
+    assert.throws(() => pushSafeWorkerArg([], "--model", value, "model"), /argv-safe/);
+  }
+});
+
+test("executor argv builders route model profile and effort by executor", () => {
+  const workflow = { workspace_policy: { workspace_root: "/tmp/dw-workspace", write_scope: ["run_dir"], network: false } };
+  const codexArgs = buildCodexExecArgs({
+    workflow,
+    task: { task_id: "cx", model: "gpt-5.1", profile: "locked/profile" },
+    lastMessagePath: "/tmp/dw-run/last-message.txt",
+    schemaPath: "/tmp/dw-run/worker-output.schema.json",
+  });
+  assert.equal(flagValueIn(codexArgs, "--model"), "gpt-5.1");
+  assert.equal(flagValueIn(codexArgs, "--profile"), "locked/profile");
+  assert.equal(flagValueIn(codexArgs, "--effort"), undefined);
+  assert.throws(
+    () =>
+      buildCodexExecArgs({
+        workflow,
+        task: { task_id: "cx", effort: "high" },
+        lastMessagePath: "/tmp/dw-run/last-message.txt",
+        schemaPath: "/tmp/dw-run/worker-output.schema.json",
+      }),
+    /effort is only supported/,
+  );
+  assert.throws(
+    () =>
+      buildCodexExecArgs({
+        workflow,
+        task: { task_id: "cx", model: "gpt 5" },
+        lastMessagePath: "/tmp/dw-run/last-message.txt",
+        schemaPath: "/tmp/dw-run/worker-output.schema.json",
+      }),
+    /argv-safe/,
+  );
+  assert.throws(
+    () =>
+      buildCodexExecArgs({
+        workflow,
+        task: { task_id: "cx", model: "a".repeat(513) },
+        lastMessagePath: "/tmp/dw-run/last-message.txt",
+        schemaPath: "/tmp/dw-run/worker-output.schema.json",
+      }),
+    /argv-safe/,
+  );
+  assert.throws(
+    () =>
+      buildCodexExecArgs({
+        workflow,
+        task: { task_id: "cx", profile: "a".repeat(513) },
+        lastMessagePath: "/tmp/dw-run/last-message.txt",
+        schemaPath: "/tmp/dw-run/worker-output.schema.json",
+      }),
+    /argv-safe/,
+  );
+
+  const claudeArgs = buildClaudeExecArgs({
+    workflow,
+    task: { task_id: "cl", model: "claude-sonnet-4-5", effort: "max", profile: "ignored-profile" },
+    settingsPath: "/tmp/dw-run/claude-settings.json",
+  });
+  assert.equal(flagValueIn(claudeArgs, "--model"), "claude-sonnet-4-5");
+  assert.equal(flagValueIn(claudeArgs, "--effort"), "max");
+  assert.equal(flagValueIn(claudeArgs, "--profile"), undefined);
+  assert.throws(
+    () =>
+      buildClaudeExecArgs({
+        workflow,
+        task: { task_id: "cl", effort: "extreme" },
+        settingsPath: "/tmp/dw-run/claude-settings.json",
+      }),
+    /effort must be one/,
+  );
+  assert.throws(
+    () =>
+      buildClaudeExecArgs({
+        workflow,
+        task: { task_id: "cl", model: "a".repeat(513) },
+        settingsPath: "/tmp/dw-run/claude-settings.json",
+      }),
+    /argv-safe/,
+  );
+});
+
+test("codex runtime guard fails stored unsafe model before spawn-only side effects", async () => {
+  const workspace = makeTempWorkspace();
+  const outside = path.join(makeTempWorkspace(), "external-input.json");
+  fs.writeFileSync(outside, "{}\n", "utf8");
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec({ input_source: outside }) });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.tasks[0].model = "-hostile";
+  });
+  refreshStoredSpecHash(planned.run_dir);
+  const tracePath = path.join(workspace, "codex-spawn-trace.jsonl");
+
+  const failed = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_TRACE_PATH: tracePath },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.tasks.t1.status, "failed");
+  assert.ok(!fs.existsSync(tracePath));
+  assert.ok(!fs.existsSync(path.join(planned.run_dir, "worker-output.schema.json")));
+  assert.ok(!workflowEventTypes(planned.run_dir).includes("input_path_warning"));
+
+  const state = readRunState(planned.run_dir);
+  const attemptDir = artifactDirForTask(planned.run_dir, state, "t1");
+  assert.ok(!fs.existsSync(path.join(attemptDir, "codex-events.jsonl")));
+  assert.equal(state.attempts[state.tasks.t1.attempts[0]].status, "failed");
+
+  // pid stays null: startCodexExec is never reached because buildCodexExecArgs
+  // throws before the child process is spawned.
+  assert.equal(state.attempts[state.tasks.t1.attempts[0]].pid, null);
+  // launch_requested is emitted in launchTask() before runAttempt() is called,
+  // so it IS present even though no binary was spawned.
+  assert.ok(workflowEventTypes(planned.run_dir).includes("launch_requested"));
+});
+
+test("claude runtime guard fails stored invalid effort before spawn-only side effects", async () => {
+  const workspace = makeTempWorkspace();
+  const outside = path.join(makeTempWorkspace(), "external-input.json");
+  fs.writeFileSync(outside, "{}\n", "utf8");
+  const planned = planWorkflow({
+    workspace,
+    spec: singleClaudeTaskSpec({ input_source: outside, effort: "high" }),
+  });
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.tasks[0].effort = "extreme";
+  });
+  refreshStoredSpecHash(planned.run_dir);
+  const tracePath = path.join(workspace, "claude-spawn-trace.jsonl");
+
+  const failed = await withEnvAsync(
+    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_TRACE_PATH: tracePath },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.tasks.t1.status, "failed");
+  assert.ok(!fs.existsSync(tracePath));
+  assert.ok(!fs.existsSync(path.join(planned.run_dir, "claude-settings.json")));
+  assert.ok(!workflowEventTypes(planned.run_dir).includes("input_path_warning"));
+
+  const state = readRunState(planned.run_dir);
+  const attemptDir = artifactDirForTask(planned.run_dir, state, "t1");
+  assert.ok(!fs.existsSync(path.join(attemptDir, "claude-events.jsonl")));
+  assert.equal(state.attempts[state.tasks.t1.attempts[0]].status, "failed");
+
+  // pid stays null: startClaudeExec is never reached because buildClaudeExecArgs
+  // throws before the child process is spawned.
+  assert.equal(state.attempts[state.tasks.t1.attempts[0]].pid, null);
+  // launch_requested is emitted in launchTask() before runAttempt() is called,
+  // so it IS present even though no binary was spawned.
+  assert.ok(workflowEventTypes(planned.run_dir).includes("launch_requested"));
+});
+
+test("codex model and profile flow from spec to argv and normalized result", async () => {
+  const workspace = makeTempWorkspace();
+  const tracePath = path.join(workspace, "codex-model-trace.jsonl");
+  const planned = planWorkflow({
+    workspace,
+    spec: singleCodexTaskSpec({ model: "gpt-5.1", profile: "locked/profile" }),
+  });
+
+  const completed = await withEnvAsync(
+    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_TRACE_PATH: tracePath },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  const trace = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
+  assert.equal(flagValueIn(trace.argv, "--model"), "gpt-5.1");
+  assert.equal(flagValueIn(trace.argv, "--profile"), "locked/profile");
+
+  const result = readJsonFile(path.join(planned.run_dir, "artifacts", "t1", "result.json"));
+  assert.match(result.summary, /model=gpt-5\.1/);
+  assert.match(result.summary, /profile=locked\/profile/);
+});
+
+test("claude model and effort flow to argv while models_used records raw result usage keys", async () => {
+  const workspace = makeTempWorkspace();
+  const tracePath = path.join(workspace, "claude-model-trace.jsonl");
+  const planned = planWorkflow({
+    workspace,
+    spec: singleClaudeTaskSpec({ model: "claude-sonnet-4-5", effort: "max" }),
+  });
+
+  const completed = await withEnvAsync(
+    {
+      CCDW_CLAUDE_BIN: fakeClaudeBin,
+      CCDW_FAKE_TRACE_PATH: tracePath,
+      CCDW_FAKE_MULTI_MODEL_USAGE: "1",
+    },
+    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  );
+
+  assert.equal(completed.status, "completed");
+  const trace = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
+  assert.equal(flagValueIn(trace.argv, "--model"), "claude-sonnet-4-5");
+  assert.equal(flagValueIn(trace.argv, "--effort"), "max");
+
+  const result = readJsonFile(path.join(planned.run_dir, "artifacts", "t1", "result.json"));
+  assert.match(result.summary, /model=claude-sonnet-4-5/);
+  assert.match(result.summary, /effort=max/);
+
+  const state = readRunState(planned.run_dir);
+  const attemptId = state.tasks.t1.attempts[0];
+  assert.deepEqual(state.attempts[attemptId].models_used, ["claude-sonnet-4-5", "fake-secondary-model"]);
+
+  const { events } = readWorkflowEvents({ runDir: planned.run_dir });
+  const started = events.find((event) => event.type === "worker_thread_started");
+  assert.equal(started.payload.model, "claude-sonnet-4-5");
+  const progress = events.find((event) => event.type === "progress" && event.payload.models_used);
+  assert.deepEqual(progress.payload.models_used, ["claude-sonnet-4-5", "fake-secondary-model"]);
+});
+
+test("workflow schema executor contract stays pinned to shared constants", () => {
+  const schema = readJsonFile(path.join(pluginRoot, "schemas", "workflow.schema.json"));
+  const taskSchema = schema.$defs.task;
+
+  assert.deepEqual(EXECUTOR_FIELD_CONTRACT, {
+    model: { codex: true, claude: true, local: false },
+    effort: { codex: false, claude: true, local: false },
+    profile: { codex: true, claude: false, local: false },
+  });
+  assert.equal(schema.$defs.modelValue.pattern, MODEL_VALUE_PATTERN_SOURCE);
+  assert.equal(taskSchema.properties.model.$ref, "#/$defs/modelValue");
+  assert.equal(taskSchema.properties.profile.$ref, "#/$defs/modelValue");
+  assert.deepEqual(taskSchema.properties.effort.enum, CLAUDE_EFFORT_LEVELS);
+  assert.deepEqual(taskSchema.allOf, [
+    {
+      if: {
+        properties: { kind: { pattern: EXECUTOR_KIND_MATCHERS.codex } },
+        required: ["kind"],
+      },
+      then: { not: { required: ["effort"] } },
+    },
+    {
+      if: {
+        properties: { kind: { pattern: EXECUTOR_KIND_MATCHERS.claude } },
+        required: ["kind"],
+      },
+      then: { not: { required: ["profile"] } },
+    },
+    {
+      if: {
+        properties: { kind: { pattern: EXECUTOR_KIND_MATCHERS.local } },
+        required: ["kind"],
+      },
+      then: {
+        not: {
+          anyOf: [{ required: ["model"] }, { required: ["effort"] }, { required: ["profile"] }],
+        },
+      },
+    },
+  ]);
+});
+
+test("dynamic workflows release version surfaces are aligned", () => {
+  const packageJson = readJsonFile(path.join(pluginRoot, "package.json"));
+  const pluginJson = readJsonFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"));
+  const mcpSource = fs.readFileSync(path.join(pluginRoot, "scripts", "dynamic-workflows-mcp.js"), "utf8");
+
+  assert.equal(packageJson.version, "0.5.0");
+  assert.equal(pluginJson.version, "0.5.0");
+  assert.match(mcpSource, /version: "0\.5\.0"/);
+});
 
 // Case 1: dispatch routing.
 test("scheduler dispatches codex and claude tasks to their own executors", async () => {

@@ -37,6 +37,17 @@ ambient settings are excluded, `apiKeyHelper`-based auth is not available to
 workers (export `ANTHROPIC_API_KEY` instead) and the user-level `model`
 setting does not apply (use the task-level `model` field).
 
+Task-level executor fields are explicit and approval-visible. `model` applies
+to codex and claude tasks, `profile` applies only to codex tasks (an explicit
+task `model` remains visible in argv and wins over any profile model setting),
+and `effort` applies only to claude tasks with one of `low`, `medium`, `high`,
+`xhigh`, or `max`. New plans reject unsupported combinations, local-task
+executor fields, and `model`/`profile` values outside
+`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$`. Stored runs remain lenient on reload,
+but v0.5.0 refuses spawned executor values that are argv-unsafe (leading `-`,
+whitespace/control characters, or more than 512 characters) before starting the
+worker.
+
 `local_*` kinds run a deterministic no-LLM executor used by the default
 template and the test suite.
 
@@ -59,6 +70,11 @@ plan time). `max_cost`, `max_retries`, `max_no_progress_iterations`,
 the approval summary lists them under `advisory_fields` so approval reflects
 what the runner actually enforces. Already-planned run directories are re-read
 with the previous, lenient rules.
+
+Approval, run, resume, and detached startup verify the stored spec hash before
+mutating run state or spawning workers. The verified workflow bytes are parsed
+once and reused for execution so an approved run cannot execute a swapped
+`workflow.yaml`.
 
 Token accounting is approximate: `cached_input_tokens` are not counted toward
 `max_tokens`, and multi-turn workers re-count their input tokens each turn, so

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { pushSafeWorkerArg } from "./executor-contract.js";
 import { startNdjsonProcess } from "./process-runner.js";
 
 // Strict-mode schema for the model's final message: codex exec --output-schema
@@ -85,11 +86,10 @@ export function buildCodexExecArgs({ workflow, task, lastMessagePath, schemaPath
   if (workspaceWrite) {
     args.push("-c", `sandbox_workspace_write.network_access=${policy.network === true}`);
   }
-  if (typeof task.model === "string" && task.model.trim() !== "") {
-    args.push("--model", task.model);
-  }
-  if (typeof task.profile === "string" && task.profile.trim() !== "") {
-    args.push("--profile", task.profile);
+  pushSafeWorkerArg(args, "--model", task.model, `task ${task.task_id} model`);
+  pushSafeWorkerArg(args, "--profile", task.profile, `task ${task.task_id} profile`);
+  if (task.effort != null) {
+    throw new Error(`task ${task.task_id} effort is only supported for claude tasks (codex: set model_reasoning_effort via a profile)`);
   }
   return args;
 }

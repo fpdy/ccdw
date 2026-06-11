@@ -3,9 +3,10 @@
 // stream-json --verbose` NDJSON contract observed on claude CLI 2.1.170:
 // system/init (session_id) -> assistant (usage telemetry) -> result
 // (structured_output, usage, total_cost_usd, is_error, subtype). Unlike
-// fake-codex there is no --output-last-message flag, so no trace file is
-// written; the result event is the whole contract.
+// fake-codex there is no --output-last-message flag; CCDW_FAKE_TRACE_PATH is
+// used by tests that need a common spawn marker across fixtures.
 import fs from "node:fs";
+import path from "node:path";
 
 function argValue(flag) {
   const index = process.argv.indexOf(flag);
@@ -22,6 +23,10 @@ const isError = process.env.CCDW_FAKE_IS_ERROR === "1";
 const schemaRetryExhausted = process.env.CCDW_FAKE_SCHEMA_RETRY_EXHAUSTED === "1";
 const totalCostUsd = Number(process.env.CCDW_FAKE_TOTAL_COST ?? 0.0123);
 const cacheCreationTokens = Number(process.env.CCDW_FAKE_CACHE_CREATION ?? 0);
+const tracePath = process.env.CCDW_FAKE_TRACE_PATH;
+const requestedModel = argValue("--model") ?? "fake-model";
+const requestedEffort = argValue("--effort");
+const multiModelUsage = process.env.CCDW_FAKE_MULTI_MODEL_USAGE === "1";
 
 const sessionId = `fake-claude-session-${process.pid}`;
 const tools = (argValue("--tools") ?? "Read,Glob,Grep,Bash").split(",");
@@ -30,12 +35,25 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 }
 
+function appendStartTrace() {
+  if (!tracePath) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+  fs.appendFileSync(
+    tracePath,
+    `${JSON.stringify({ event: "start", kind: "claude", pid: process.pid, argv: process.argv.slice(2) })}\n`,
+  );
+}
+
+appendStartTrace();
+
 emit({
   type: "system",
   subtype: "init",
   session_id: sessionId,
   tools,
-  model: "fake-model",
+  model: requestedModel,
   claude_code_version: "2.1.170",
 });
 
@@ -67,6 +85,9 @@ setTimeout(() => {
       cache_creation_input_tokens: cacheCreationTokens,
       output_tokens: outputTokens,
     },
+    modelUsage: multiModelUsage
+      ? { [requestedModel]: { input_tokens: 1 }, "fake-secondary-model": { input_tokens: 2 } }
+      : { [requestedModel]: { input_tokens: 1 } },
   };
 
   if (schemaRetryExhausted) {
@@ -91,7 +112,7 @@ setTimeout(() => {
   } else {
     const structuredOutput = {
       status: resultStatus,
-      summary: `fake claude worker handled: ${prompt.slice(0, 60)}`,
+      summary: `fake claude worker handled: ${prompt.slice(0, 60)} model=${requestedModel} effort=${requestedEffort ?? ""}`,
       findings: [],
       errors: resultStatus === "failed" ? ["fake failure"] : [],
       evidence: [],

@@ -18,6 +18,9 @@ const outputTokens = Number(process.env.CCDW_FAKE_TOKENS ?? 50);
 const resultStatus = process.env.CCDW_FAKE_RESULT_STATUS ?? "succeeded";
 const failMarker = process.env.CCDW_FAKE_FAIL_MARKER;
 const invalidJson = process.env.CCDW_FAKE_INVALID_JSON === "1";
+const tracePath = process.env.CCDW_FAKE_TRACE_PATH;
+const requestedModel = argValue("--model");
+const requestedProfile = argValue("--profile");
 
 const traceDir = lastMessagePath ? path.dirname(lastMessagePath) : null;
 const startedAt = Date.now();
@@ -36,6 +39,19 @@ function writeTrace() {
   );
 }
 
+function appendStartTrace() {
+  if (!tracePath) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+  fs.appendFileSync(
+    tracePath,
+    `${JSON.stringify({ event: "start", kind: "codex", pid: process.pid, argv: process.argv.slice(2) })}\n`,
+  );
+}
+
+appendStartTrace();
+
 emit({ type: "thread.started", thread_id: `fake-thread-${process.pid}` });
 emit({ type: "turn.started" });
 
@@ -51,7 +67,7 @@ setTimeout(() => {
     ? "this is not json"
     : JSON.stringify({
         status: resultStatus,
-        summary: `fake worker handled: ${prompt.slice(0, 60)}`,
+        summary: `fake worker handled: ${prompt.slice(0, 60)} model=${requestedModel ?? ""} profile=${requestedProfile ?? ""}`,
         findings: [],
         errors: resultStatus === "failed" ? ["fake failure"] : [],
         evidence: [],
