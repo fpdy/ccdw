@@ -9,7 +9,7 @@ Dynamic Workflows拡張機能の実装を管理しています。
 
 Dynamic Workflowsは、作業計画を本物の `codex exec` または `claude -p`
 サブエージェントで実行する手元の宣言的な作業手順実行に変換します。呼び出し側エージェントがWorkflowSpec
-(JSON) を書き、実行プログラムがそれを検証し、上限を超えたら安全側で停止する
+(JSON。CLIからはYAMLも可) を書き、実行プログラムがそれを検証し、上限を超えたら安全側で停止する
 予算管理のもとでタスクを並列スケジュールします。作業手順の仕様、実行状態、
 追記型の処理記録、作業成果物を保存し、承認、実行、監視、再開、取り消しが
 できるようにします。
@@ -75,6 +75,44 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
 指定されている場合にその値が表示されます。argvとして安全でない格納値は、
 workerの起動前に実行処理が拒否します。
 
+作業手順DSL (スキーマv2) は次に対応しています。
+
+- **タスク単位の型付き出力** (`output_schema`): 制限付きのJSON Schemaサブセット
+  (許可リスト方式のキーワード、深さとサイズの上限、`required` と
+  `additionalProperties: false` は実行プログラムが自動生成)。型付きの結果は
+  `result.output` フィールドとして保存され、後続機能の参照先になります。
+- **`{{...}}` テンプレート**: `prompt_template` 内での純粋な置換のみ。
+  `{{objective}}`、`{{inputs.*}}`、`{{tasks.<id>.result.<dotpath>}}`、
+  `{{item}}`、`{{gate_feedback}}` を計画時に静的検証します (参照先タスクは
+  `depends_on` の推移閉包に含まれている必要があり、dotpathは参照先の
+  スキーマに対して解決できる必要があります)。
+- **コマンドゲート** (`gates`): スキーマ検証を通過した作業結果の後に実行する
+  決定論的な検証コマンド。失敗すると再試行可能な `gate_failed` 状態になり、
+  失敗出力が再試行プロンプトに注入されます。ゲートはOSサンドボックスなしで
+  実行され、`cwd` はワークスペースルートに固定、環境変数は許可リストのみで、
+  すべてのゲートコマンドが承認サマリに全文表示されます。
+- **enum分岐** (`route`): workerがスキーマで強制されたenum値を報告し、その値で
+  実行するcaseタスクを選択します。選択されなかったcaseタスクは
+  `skipped_by_route` になり、実行を失敗させずに依存関係を満たします。
+- **有界なfan-out** (`foreach`): 親タスクが、依存タスクの出力配列を子タスクに
+  展開します。必須の `max_items` を超えると切り詰めずに失敗し (fail-closed)、
+  計画時に `max_agents` に対して計上されます。順序を保った集約結果は親の
+  `result.output.results` に書き込まれます。
+- **保存済みワークフロー**: `<CCDW_HOME>/workflows` 配下の再利用可能な
+  テンプレートと型付き入力 (`plan --workflow <name> --input key=value`)。
+  検証前に展開され、承認サマリに由来情報 (provenance) が記録されます。
+- **YAMLでの記述** (CLIのみ): `plan --spec-file spec.yaml` は厳格なYAML 1.2
+  (anchor/alias禁止、キー重複禁止) を解析してJSONに正規化するため、保存される
+  仕様とハッシュの仕組みは変わりません。
+
+v0.6.0は互換性を破壊するリリースです。`schema_version` は
+`dynamic-workflows.v2` に上がり、それより前のバージョンで計画した実行
+ディレクトリは明示エラーで拒否されます (再計画が必要)。格納済み実行の
+緩い再読み込みは削除され、格納済み仕様も厳格に検証されます。v1のフィールド
+`expected_output_schema`、`verification_required`、`verification_policy`、
+`fanout_source` は削除され、`output_schema`、`gates`、`foreach` を使うよう
+エラーで案内されます。
+
 スケジューラはフェーズ/タスクDAG上のready-queueです。依存が満たされたタスクから
 `max_concurrency` まで並列に実行し、`max_tokens`、`max_duration_ms`、
 `max_agents` を超えたら安全側で停止します。タスク単位の再試行ポリシー
@@ -130,8 +168,11 @@ node plugins/dynamic-workflows/scripts/dynamic-workflows.js plan \
 ```
 
 `plan` コマンドは `run_dir` と `approval.summary` (フェーズ、タスクごとの
-プロンプト、強制されるサンドボックス、予算、仕様ハッシュ) を返します。
-以降のコマンドでは `run_dir` を使います。`--spec-file` なしの `plan --objective "..."` は
+プロンプト、ゲートコマンド、強制されるサンドボックス、予算、仕様ハッシュ) を返します。
+以降のコマンドでは `run_dir` を使います。`--spec-file` は `.yaml`/`.yml` も
+受け付けます。`plan --workflow <name> --input key=value` は
+`<CCDW_HOME>/workflows` の保存済みワークフローを型付き入力で計画します。
+`--spec-file` なしの `plan --objective "..."` は
 固定のローカルテンプレート (動作確認用) を計画します。
 
 ## 実行コマンド
@@ -233,6 +274,12 @@ npm test
 - 同梱の擬似claudeバイナリによるclaude実行 (実行処理の振り分け、
   終了コード0でも `is_error` なら失敗とする判定、構造化出力のスキーマ違反の
   隔離、一箇所での予算計上、networkの計画時拒否)。
+- v0.6.0のDSL機能の専用テストファイル: 型付き出力スキーマ
+  (`typed-output.test.js`)、テンプレートの解析と統合 (`template.test.js`、
+  `template-integration.test.js`)、コマンドゲート (`gates.test.js`、
+  `gates-integration.test.js`)、route分岐 (`route.test.js`)、有界foreach
+  ファンアウト (`foreach.test.js`)、YAML仕様入力 (`yaml-spec.test.js`)、
+  型付き入力つき保存済みワークフロー (`saved-workflows.test.js`)。
 - 実行中の取り消し (制御チャネル経由) と計画済み実行の取り消し。
 - バックグラウンド実行と異常終了からの再開 (`--resume-failed` を含む)、
   および強制再計画時の古い状態削除。
@@ -255,7 +302,8 @@ npm test
 }
 ```
 
-MCPの操作口は、計画作成 (呼び出し側作成の `spec` オブジェクト対応)、承認、
+MCPの操作口は、計画作成 (呼び出し側作成の `spec` オブジェクト、または
+`workflow` と型付き `inputs` による保存済みワークフローに対応)、承認、
 実行 (既定でバックグラウンド開始し即座に返答。状態はポーリング)、再開、
 状態確認、実行一覧、イベント差分取得、取り消し、検証のための機能を公開します。
 ツールの失敗は `isError` 付きの結果として返されるため、呼び出し側モデルは

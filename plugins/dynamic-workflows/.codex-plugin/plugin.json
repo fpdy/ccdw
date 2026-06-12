@@ -1,6 +1,6 @@
 {
   "name": "dynamic-workflows",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Plan, run, resume, and audit local declarative workflows with codex exec or claude -p subagents.",
   "author": {
     "name": "fpdy"

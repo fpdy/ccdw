@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// Spec-file parsing (JSON/YAML) lives next to the saved-workflow loader so the
+// CLI and the engine share one parser; it is not part of the core.js facade.
+import { readSpecFile } from "./lib/saved-workflows.js";
 import {
   approveWorkflow,
   cancelWorkflow,
@@ -35,6 +37,9 @@ async function main() {
   let result;
   switch (command) {
     case "plan": {
+      if (options.specFile && options.workflow) {
+        throw new WorkflowError("--spec-file and --workflow are mutually exclusive.");
+      }
       let spec;
       if (options.specFile) {
         spec = readSpecFile(options.specFile);
@@ -42,6 +47,8 @@ async function main() {
       result = planWorkflow({
         objective: options.objective,
         spec,
+        workflow: options.workflow,
+        inputs: parseInputAssignments(options.input),
         workspace: options.workspace,
         runRoot: options.runRoot,
         runId: options.runId,
@@ -126,22 +133,21 @@ async function main() {
   printResult(command, result, Boolean(options.json));
 }
 
-function readSpecFile(specFile) {
-  const resolved = path.resolve(specFile);
-  let raw;
-  try {
-    raw = fs.readFileSync(resolved, "utf8");
-  } catch (error) {
-    throw new WorkflowError(`Could not read spec file: ${error.message}`, { specFile: resolved });
+// Saved-workflow input values stay strings here; loadSavedWorkflow coerces
+// them by the declared type.
+function parseInputAssignments(entries) {
+  if (entries == null) {
+    return undefined;
   }
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    throw new WorkflowError(`Spec file is not valid JSON: ${error.message}`, {
-      specFile: resolved,
-      hint: "The workflow spec must be a JSON object (phases[], tasks[], budgets).",
-    });
+  const inputs = {};
+  for (const entry of entries) {
+    const separatorIndex = typeof entry === "string" ? entry.indexOf("=") : -1;
+    if (separatorIndex < 1) {
+      throw new WorkflowError("--input expects key=value.", { input: entry });
+    }
+    inputs[entry.slice(0, separatorIndex)] = entry.slice(separatorIndex + 1);
   }
+  return inputs;
 }
 
 function parseArgs(argv) {
@@ -156,21 +162,35 @@ function parseArgs(argv) {
     if (!arg.startsWith("--")) {
       throw new WorkflowError(`Unexpected positional argument: ${arg}`);
     }
-    const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
+    // Split on the first "=" only: values like --input key=value keep their
+    // own "=" intact.
+    const separatorIndex = arg.indexOf("=");
+    const rawKey = separatorIndex === -1 ? arg.slice(2) : arg.slice(2, separatorIndex);
     const key = toCamelCase(rawKey);
-    if (inlineValue !== undefined) {
-      options[key] = coerceValue(key, rawKey, inlineValue);
+    if (separatorIndex !== -1) {
+      setOption(options, key, coerceValue(key, rawKey, arg.slice(separatorIndex + 1)));
       continue;
     }
     const next = argv[index + 1];
     if (next == null || next.startsWith("--")) {
-      options[key] = true;
+      setOption(options, key, true);
       continue;
     }
-    options[key] = coerceValue(key, rawKey, next);
+    setOption(options, key, coerceValue(key, rawKey, next));
     index += 1;
   }
   return { command, options };
+}
+
+// Flags that may be repeated accumulate into an array; all others overwrite.
+const REPEATABLE_OPTIONS = new Set(["input"]);
+
+function setOption(options, key, value) {
+  if (REPEATABLE_OPTIONS.has(key)) {
+    (options[key] ??= []).push(value);
+    return;
+  }
+  options[key] = value;
 }
 
 function toCamelCase(value) {

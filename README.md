@@ -9,7 +9,7 @@ Workflows plugin implementation.
 
 Dynamic Workflows turns a task plan into a local declarative workflow run
 executed by real `codex exec` or `claude -p` subagents. The calling agent authors a
-WorkflowSpec JSON; the runner validates it, schedules tasks in parallel with
+WorkflowSpec (JSON, or YAML via the CLI); the runner validates it, schedules tasks in parallel with
 fail-closed budgets, and writes a workflow specification, runtime state, an
 append-only event log, and task artifacts so the workflow can be approved,
 executed, watched, resumed, or cancelled.
@@ -75,6 +75,44 @@ and local tasks reject all executor fields in new plans. Approval summaries
 include these fields when present, and spawned executors reject argv-unsafe
 stored values before launch.
 
+The workflow DSL (schema v2) supports:
+
+- **Typed task outputs** (`output_schema`): a restricted JSON-Schema subset
+  (whitelisted keywords, depth/size limits, runner-generated `required` and
+  `additionalProperties: false`) typed into the worker result envelope; typed
+  results expose a `result.output` field that downstream features reference.
+- **`{{...}}` templates** in `prompt_template`: pure substitution of
+  `{{objective}}`, `{{inputs.*}}`, `{{tasks.<id>.result.<dotpath>}}`,
+  `{{item}}`, and `{{gate_feedback}}`, statically validated at plan time
+  (producers must be declared dependencies; dotpaths must resolve against the
+  producer's schema).
+- **Command gates** (`gates`): deterministic verification commands run after a
+  schema-valid worker result; any failure yields the retryable `gate_failed`
+  status with failure output injected into the retry prompt. Gates run with no
+  OS sandbox, `cwd` pinned to the workspace root, and an env allowlist, and
+  every gate command is listed verbatim in the approval summary.
+- **Enum branching** (`route`): the worker reports a schema-enforced enum
+  value that selects which case tasks run; unselected case tasks become
+  `skipped_by_route`, which satisfies dependencies without failing the run.
+- **Bounded fan-out** (`foreach`): a parent task expands over a producer's
+  array into child tasks, fail-closed on the required `max_items` (no
+  truncation) and counted against `max_agents` at plan time, with an ordered
+  aggregate written to the parent's `result.output.results`.
+- **Saved workflows**: reusable templates under `<CCDW_HOME>/workflows` with
+  typed inputs (`plan --workflow <name> --input key=value`), expanded before
+  validation and recorded with provenance in the approval summary.
+- **YAML authoring** (CLI only): `plan --spec-file spec.yaml` parses strict
+  YAML 1.2 (no anchors/aliases, no duplicate keys) and normalizes to JSON, so
+  the stored spec and its hash mechanism are unchanged.
+
+v0.6.0 is a breaking release: `schema_version` is bumped to
+`dynamic-workflows.v2`, run directories planned with earlier versions are
+rejected ("re-plan required"), the lenient re-read of stored runs is removed
+(stored specs are validated strictly), and the v1 fields
+`expected_output_schema`, `verification_required`, `verification_policy`, and
+`fanout_source` are rejected in favor of `output_schema`, `gates`, and
+`foreach`.
+
 The scheduler is a ready-queue over the phase/task DAG: tasks run as soon as
 their dependencies succeed, up to `max_concurrency`, and the run fails closed
 when `max_tokens`, `max_duration_ms`, or `max_agents` is exceeded. Retry
@@ -131,9 +169,12 @@ node plugins/dynamic-workflows/scripts/dynamic-workflows.js plan \
 ```
 
 The `plan` command returns a `run_dir` and an `approval.summary` (phases,
-per-task prompts, enforced sandbox, budget, spec hash). Use the `run_dir` in
-later commands. `plan --objective "..."` without a spec file plans a fixed
-local explore/verify/synthesize template, useful as a smoke test.
+per-task prompts, gate commands, enforced sandbox, budget, spec hash). Use the
+`run_dir` in later commands. `--spec-file` also accepts `.yaml`/`.yml` files.
+`plan --workflow <name> --input key=value` plans a saved workflow template
+from `<CCDW_HOME>/workflows` with typed inputs. `plan --objective "..."`
+without a spec file plans a fixed local explore/verify/synthesize template,
+useful as a smoke test.
 
 ## Runner Commands
 
@@ -235,6 +276,13 @@ The current tests cover:
 - The claude executor against a bundled fake claude binary (dispatch routing,
   exit-0-with-`is_error` failure trap, structured-output quarantine,
   single-point budget accounting, plan-time network rejection).
+- The v0.6.0 DSL features in dedicated test files: typed output schemas
+  (`typed-output.test.js`), template parsing and integration
+  (`template.test.js`, `template-integration.test.js`), command gates
+  (`gates.test.js`, `gates-integration.test.js`), route branching
+  (`route.test.js`), bounded foreach fan-out (`foreach.test.js`), YAML spec
+  input (`yaml-spec.test.js`), and saved workflows with typed inputs
+  (`saved-workflows.test.js`).
 - Cancellation of live runs via the control channel and of planned runs.
 - Detached background execution and crash-safe resume, including
   `--resume-failed`, plus stale-state cleanup for forced re-planning.
@@ -259,10 +307,11 @@ The configured server starts from the plugin root:
 ```
 
 The MCP interface exposes tools for planning (with caller-authored `spec`
-objects), approving, running (detached by default; poll status), resuming,
-reading status, listing runs, reading incremental events, cancelling, and
-validating Dynamic Workflows runs. Tool failures are returned as `isError`
-results so the calling model can react without timing out.
+objects, or saved workflows via `workflow` + typed `inputs`), approving,
+running (detached by default; poll status), resuming, reading status, listing
+runs, reading incremental events, cancelling, and validating Dynamic
+Workflows runs. Tool failures are returned as `isError` results so the calling
+model can react without timing out.
 
 ## Local Artifacts
 

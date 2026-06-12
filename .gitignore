@@ -13,6 +13,7 @@ node_modules/
 
 # agents
 opencode.jsonc
+.cursor/
 .codex/
 .agents/
 .claude

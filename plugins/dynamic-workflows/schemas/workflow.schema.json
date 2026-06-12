@@ -19,11 +19,10 @@
     "max_no_progress_iterations",
     "required_capabilities",
     "workspace_policy",
-    "verification_policy",
     "stop_conditions"
   ],
   "properties": {
-    "schema_version": { "type": "string" },
+    "schema_version": { "const": "dynamic-workflows.v2" },
     "workflow_id": { "type": "string" },
     "run_id": { "type": "string", "pattern": "^(?!\\.+$)[A-Za-z0-9._-]{1,64}$" },
     "name": { "type": "string" },
@@ -63,7 +62,6 @@
         "worker_isolation": { "type": "string" }
       }
     },
-    "verification_policy": { "type": "object" },
     "stop_conditions": {
       "type": "array",
       "items": { "type": "string" }
@@ -79,7 +77,6 @@
         "entry_condition",
         "tasks",
         "completion_condition",
-        "verification_required",
         "on_failure",
         "outputs"
       ],
@@ -90,7 +87,6 @@
         "entry_condition": { "type": "string", "enum": ["always", "dependencies_succeeded"] },
         "tasks": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
         "completion_condition": { "const": "all_tasks_succeeded" },
-        "verification_required": { "type": "boolean" },
         "on_failure": { "type": "string", "enum": ["fail", "continue"] },
         "outputs": { "type": "array", "items": { "type": "string" } }
       }
@@ -105,9 +101,7 @@
         "prompt_template",
         "input_source",
         "depends_on",
-        "expected_output_schema",
         "retry_policy",
-        "verification_required",
         "stop_condition",
         "outputs"
       ],
@@ -116,7 +110,10 @@
         "phase_id": { "$ref": "#/$defs/specId" },
         "kind": { "type": "string" },
         "role": { "type": "string" },
-        "prompt_template": { "type": "string" },
+        "prompt_template": {
+          "type": "string",
+          "description": "Worker instructions. May embed template references: {{objective}}, {{tasks.<taskId>.result.<dotpath>}} (producer must be in the task's depends_on transitive closure; the dotpath must resolve against the producer's synthesized worker result schema, must not path into arrays, and must not resolve to a nullable [\"<scalar>\",\"null\"] property), {{item...}} (only with foreach), and {{gate_feedback}} (only with gates). All references are statically validated at plan time; leftover {{inputs.*}} references are rejected (saved-workflow inputs are expanded before validation). Template syntax ({{) is forbidden everywhere else, including gates[].command argv entries."
+        },
         "input_source": {
           "anyOf": [
             { "type": "string", "enum": ["objective", "accepted_worker_results"] },
@@ -128,12 +125,33 @@
             }
           ]
         },
-        "fanout_source": { "const": null },
         "depends_on": { "type": "array", "items": { "$ref": "#/$defs/specId" } },
         "condition": { "type": "string", "enum": ["always", "dependencies_succeeded"] },
-        "expected_output_schema": { "type": "string" },
+        "output_schema": {
+          "$ref": "#/$defs/outputSchemaNode",
+          "description": "Restricted typed-output declaration (v2 subset): whitelist keywords {type, properties, items, enum, description, title}; root must be type object; nesting depth <= 4, <= 64 total properties, <= 8 nullable unions, <= 32KB serialized. The runner generates required (all property names) and injects additionalProperties: false on every object; the planned spec stores the normalized form. Not supported for local task kinds."
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/gate" },
+          "description": "Quality gates executed sequentially in declaration order after an accepted (schema-valid, succeeded) worker result, while the task holds its concurrency slot. All gates exit 0 -> the task succeeds; any non-zero exit or timeout -> status gate_failed, which is retryable under the task's single retry_policy.max_attempts counter (worker failures and gate failures share attempts). Gates run with no OS sandbox, cwd = workspace_policy.workspace_root, an env allowlist of PATH/HOME/TMPDIR/LANG/LC_ALL, argv-only (no shell). Not supported for local task kinds."
+        },
+        "gate_feedback_tail_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16384,
+          "description": "Per-stream tail size (bytes) of failed-gate stdout/stderr included in the {{gate_feedback}} retry text. Default 4096; requires gates."
+        },
+        "route": {
+          "$ref": "#/$defs/route",
+          "description": "Enum-based branching (F4). The worker envelope gains a required `route` string enum (value domain = values). When the routing task finally succeeds (post-gates) the route resolves once: cases[value] (falling back to default) selects the case tasks to activate; case tasks not selected become skipped_by_route (terminal, satisfies dependencies, never fails the run, not resumable). Plan-time rules: cases keys must be a subset of values and default is required (V1); every case task must include the routing task in its depends_on transitive closure (V2); only case tasks of the same route may depend directly on a case task (V3); a task may be a case task of at most one routing task (V4); route and foreach are mutually exclusive and the routing task must not list itself (V5); template references to a case-task producer require the consumer to be a co-activated case task of the same route (V7). Not supported for local task kinds."
+        },
+        "foreach": {
+          "$ref": "#/$defs/foreach",
+          "description": "Bounded fan-out (F6). When the task's dependencies are satisfied it expands instead of launching a worker (status `expanded`, non-terminal, no attempt consumed): the resolved items array yields children `<task_id>.<index>` (0-based) that inherit kind/model/effort/profile/timeout_ms/retry_policy/output_schema/gates/gate_feedback_tail_bytes and render the parent's prompt_template with {{item}}/{{item.<path>}}. One replayable `tasks_expanded` event records the expansion (fail-closed when the serialized items exceed 256 KiB). More items than max_items fails the parent without truncation; zero items succeed immediately with an empty aggregate. After all children are terminal the runner synthesizes the parent's result.json (typed envelope, attempt_id \"aggregate\") with output.results as an order-preserving array of {index, task_id, status, output|null}; the parent succeeds while permanently failed children stay within tolerated_failure_count. Downstream templates may reference only {{tasks.<task_id>.result.output.results}}. ID-collision rule: any other spec task_id matching ^<task_id>\\.[0-9]+$ is rejected at plan time (the child id space is reserved). Budget precondition: spec task count + sum of max_items over all foreach tasks must not exceed max_agents, or the plan is rejected. route and foreach are mutually exclusive. Not supported for local task kinds."
+        },
         "retry_policy": { "$ref": "#/$defs/retryPolicy" },
-        "verification_required": { "type": "boolean" },
         "stop_condition": { "const": "budget_or_cancelled" },
         "timeout_ms": { "type": "integer", "minimum": 1 },
         "model": { "$ref": "#/$defs/modelValue" },
@@ -166,7 +184,12 @@
               "anyOf": [
                 { "required": ["model"] },
                 { "required": ["effort"] },
-                { "required": ["profile"] }
+                { "required": ["profile"] },
+                { "required": ["output_schema"] },
+                { "required": ["gates"] },
+                { "required": ["gate_feedback_tail_bytes"] },
+                { "required": ["route"] },
+                { "required": ["foreach"] }
               ]
             }
           }
@@ -176,6 +199,123 @@
     "specId": {
       "type": "string",
       "pattern": "^(?!\\.+$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "gate": {
+      "type": "object",
+      "required": ["command", "timeout_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "description": "Argv array executed directly (no shell). Elements must not contain control characters or template syntax ({{); command[0] (the executable) must not start with \"-\" (later elements may be flags). Each element is at most 512 characters."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required per-gate timeout. Effective timeout is max(min(timeout_ms, remaining run duration budget), 1000); on expiry the gate's process group is killed and the verdict records timed_out."
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "required": ["values", "cases", "default"],
+      "additionalProperties": false,
+      "properties": {
+        "values": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "description": "Distinct enum values the worker may report as `route` (limits aligned with the output_schema enum limits)."
+        },
+        "cases": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/specId" }
+          },
+          "description": "Maps a route value to the case tasks activated by that resolution. Keys must be a subset of values; values without a key resolve to default. An empty array is allowed (the resolution activates nothing)."
+        },
+        "default": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/specId" },
+          "description": "Required fallback selection for values without an explicit case. An empty array is allowed."
+        }
+      }
+    },
+    "foreach": {
+      "type": "object",
+      "required": ["items", "max_items"],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "string",
+          "description": "Exactly one whole-field {{tasks.<id>.result.<dotpath>}} reference (no surrounding text). The producer must be in this task's depends_on transitive closure and the dotpath must resolve to an array-typed property in the producer's synthesized worker result schema (for a foreach producer, only output.results)."
+        },
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required hard bound on the expansion. More resolved items than max_items fails the parent (fail-closed, no truncation). Counts toward the plan-time budget precondition: spec tasks + sum of max_items <= max_agents."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-parent child concurrency; the effective limit is min(concurrency, workflow.max_concurrency). Defaults to workflow.max_concurrency."
+        },
+        "tolerated_failure_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of permanently failed children (after retries) the parent tolerates while still folding to succeeded. Default 0."
+        }
+      }
+    },
+    "outputSchemaNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "anyOf": [
+            { "enum": ["object", "array", "string", "number", "integer", "boolean"] },
+            {
+              "type": "array",
+              "prefixItems": [
+                { "enum": ["string", "number", "integer", "boolean"] },
+                { "const": "null" }
+              ],
+              "minItems": 2,
+              "maxItems": 2,
+              "items": false
+            }
+          ]
+        },
+        "properties": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+          "additionalProperties": { "$ref": "#/$defs/outputSchemaNode" }
+        },
+        "items": { "$ref": "#/$defs/outputSchemaNode" },
+        "enum": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "type": "string", "maxLength": 64 }
+        },
+        "required": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Runner-generated (all property names); user-authored values are rejected at plan time."
+        },
+        "additionalProperties": {
+          "const": false,
+          "description": "Runner-injected on every object; user-authored values are rejected at plan time."
+        },
+        "description": { "type": "string" },
+        "title": { "type": "string" }
+      }
     },
     "modelValue": {
       "type": "string",

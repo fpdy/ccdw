@@ -2,35 +2,66 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local.codex.dynamic-workflows/schemas/worker-result.schema.json",
   "title": "Dynamic Workflows WorkerResult",
-  "type": "object",
-  "required": [
-    "task_id",
-    "attempt_id",
-    "status",
-    "summary",
-    "findings",
-    "errors",
-    "evidence",
-    "modified_files",
-    "commands_run",
-    "artifacts"
+  "description": "Worker result envelope v2 (dynamic-workflows.v2). Tasks without output_schema use the default form; tasks with output_schema use the typed form, where output is validated against the task's normalized output_schema. task_id and attempt_id are injected by the runner, never trusted from the model. Tasks declaring route (F4) additionally carry a required `route` string whose enum equals the task's route.values, in either form.",
+  "oneOf": [
+    { "$ref": "#/$defs/defaultResult" },
+    { "$ref": "#/$defs/typedResult" }
   ],
-  "properties": {
-    "task_id": { "type": "string" },
-    "attempt_id": { "type": "string" },
-    "status": { "enum": ["succeeded", "failed"] },
-    "summary": { "type": "string" },
-    "findings": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/finding" }
-    },
-    "errors": { "type": "array", "items": { "type": "string" } },
-    "evidence": { "type": "array", "items": { "type": "string" } },
-    "modified_files": { "type": "array", "items": { "type": "string" } },
-    "commands_run": { "type": "array", "items": { "type": "string" } },
-    "artifacts": { "type": "array", "items": { "type": "string" } }
-  },
   "$defs": {
+    "defaultResult": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "attempt_id",
+        "status",
+        "summary",
+        "findings",
+        "errors",
+        "evidence",
+        "modified_files",
+        "commands_run",
+        "artifacts"
+      ],
+      "properties": {
+        "task_id": { "type": "string" },
+        "attempt_id": { "type": "string" },
+        "status": { "enum": ["succeeded", "failed"] },
+        "summary": { "type": "string" },
+        "findings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/finding" }
+        },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "modified_files": { "type": "array", "items": { "type": "string" } },
+        "commands_run": { "type": "array", "items": { "type": "string" } },
+        "artifacts": { "type": "array", "items": { "type": "string" } },
+        "route": {
+          "type": "string",
+          "description": "Present (and required) only on tasks declaring route (F4); constrained to the task's route.values enum."
+        }
+      }
+    },
+    "typedResult": {
+      "type": "object",
+      "required": ["task_id", "attempt_id", "status", "summary", "errors", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "attempt_id": { "type": "string" },
+        "status": { "enum": ["succeeded", "failed"] },
+        "summary": { "type": "string" },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "route": {
+          "type": "string",
+          "description": "Present (and required) only on tasks declaring route (F4); constrained to the task's route.values enum."
+        },
+        "output": {
+          "type": "object",
+          "description": "Task-specific payload validated against the task's normalized output_schema."
+        }
+      }
+    },
     "finding": {
       "type": "object",
       "required": [

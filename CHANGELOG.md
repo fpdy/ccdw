@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.6.0 - 2026-06-12
+
+### Changed (breaking)
+
+- Backward compatibility is dropped entirely: `schema_version` is bumped to
+  `dynamic-workflows.v2`, and run directories planned with earlier versions
+  are rejected by `status`/`run`/`resume`/`validate` with an explicit
+  "unsupported schema_version; re-plan required" error.
+- The lenient re-read path for stored runs is removed. Stored specs are
+  re-validated with the same strict rules as new plans; there is no longer a
+  separate lenient ruleset for already-planned run directories.
+- Five v1 fields are removed and now fail plan-time validation with pointers
+  to their replacements: task `expected_output_schema` (→ `output_schema`),
+  task/phase `verification_required` and workflow `verification_policy`
+  (→ task `gates`), and `fanout_source` (→ task `foreach`). The approval
+  summary's `advisory_fields` shrinks to `max_cost`, `max_retries`, and
+  `max_no_progress_iterations`.
+
+### Added
+
+- F0 typed task output: optional task `output_schema` declares a restricted
+  JSON-Schema subset (whitelisted keywords `type`/`properties`/`items`/`enum`/
+  `description`/`title`; root object; depth ≤ 4, ≤ 64 properties, ≤ 8 nullable
+  `["X","null"]` unions, ≤ 32 KB; string-only enums). The runner generates
+  `required` and injects `additionalProperties: false`, synthesizes the worker
+  envelope v2 per task (typed tasks report `{task_id, attempt_id, status,
+  summary, errors, output}` and drop the self-report audit fields), and keeps
+  double validation plus quarantine; `result.output` is the reference target
+  for templates, route, and foreach. Rejected for local task kinds.
+- F1 YAML authoring (CLI-only): `plan --spec-file` accepts `.yaml`/`.yml`,
+  parsed with the `yaml` package (YAML 1.2, duplicate keys rejected,
+  anchors/aliases forbidden via `maxAliasCount: 0`, 1 MiB input cap,
+  `file:line:col` errors) and normalized to JSON before storage, so the stored
+  spec bytes and the spec-hash mechanism are unchanged. New dependency:
+  `yaml@^2`.
+- F2 `{{...}}` templates in `prompt_template`: pure substitution of
+  `{{objective}}`, `{{inputs.*}}` (saved workflows only; plain specs reject
+  it), `{{tasks.<id>.result.<dotpath>}}`,
+  `{{item}}`, and `{{gate_feedback}}`, statically validated at plan time
+  (producer must be in the consumer's `depends_on` transitive closure, dotpath
+  must resolve against the producer's synthesized schema, nullable properties
+  and array indexing are rejected, `{{` is forbidden in `gates[].command`).
+  Objects/arrays render as compact JSON; a defensive runtime resolution
+  failure fails the task without retry and records a
+  `template_resolution_failed` event.
+- F3 command gates: `gates: [{command, timeout_ms}]` run sequentially after a
+  schema-valid worker result while the task holds its concurrency slot; any
+  non-zero exit or timeout yields the new `gate_failed` status (terminal,
+  retryable, resumable) under the task's single `retry_policy.max_attempts`
+  counter shared with worker failures. Gates run argv-only with no OS sandbox,
+  `cwd` pinned to the workspace root, and an env allowlist
+  (`PATH`/`HOME`/`TMPDIR`/`LANG`/`LC_ALL`); the approval summary lists every
+  command verbatim. Per-attempt artifacts `gate-<n>.stdout.log`/
+  `gate-<n>.stderr.log` (1 MiB cap) and `gate-verdict.json`, events
+  `gate_started`/`gate_result`, and `{{gate_feedback}}` retry injection
+  (4096-byte tails by default, `gate_feedback_tail_bytes` ≤ 16384;
+  auto-appended on retries when the placeholder is absent).
+- F4 enum branching: task `route` (`values`, `cases`, required `default`)
+  injects a required `route` string enum into the worker envelope and resolves
+  once on the routing task's final (post-gates) success, recording a
+  `route_resolved` event; unselected case tasks get the new
+  `skipped_by_route` status (terminal, satisfies dependencies, never fails or
+  cascades, excluded from resume, reported separately as `routed_skipped`).
+  Case arrays are unordered activation sets (ordering stays in `depends_on`);
+  plan-time topology rules enforce cases ⊆ values, routing-task dependency
+  closure for case tasks, no out-of-route dependencies on case tasks, at most
+  one route per case task, route/foreach exclusivity, and route-consistent
+  template references.
+- F5 saved workflows: templates under `<CCDW_HOME>/workflows/<name>.{json,
+  yaml,yml}` (safe-name pattern plus containment check) with typed `inputs`
+  (`string`/`integer`/`number`/`boolean`, `required`/`default`); CLI
+  `plan --workflow <name> --input key=value` coerces strings by declared type,
+  MCP `workflow`+`inputs` validates typed JSON without coercion; unknown,
+  missing-required, or mistyped inputs fail the plan. `{{inputs.*}}` expands
+  in `objective`/`prompt_template` before the normal pipeline (the spec hash
+  covers the expanded spec) and provenance (template name, path, hash,
+  resolved inputs) is recorded in the plan result and approval summary.
+- F6 bounded foreach fan-out: task `foreach` (`items` as a single whole-field
+  producer-array reference, required `max_items`, `concurrency`,
+  `tolerated_failure_count`) expands the parent (new non-terminal `expanded`
+  status) into `<parent>.<index>` children that inherit executor fields,
+  `output_schema`, and `gates`, recording a `tasks_expanded` event (fail-closed
+  when serialized items exceed 256 KB). More items than `max_items` fails the
+  parent without truncation; zero items succeed with an empty aggregate; the
+  plan is rejected unless static tasks + Σ `max_items` ≤ `max_agents`; child
+  concurrency is `min(foreach.concurrency, max_concurrency)`. The runner
+  aggregates ordered child results into the parent's `result.output.results`,
+  succeeds within `tolerated_failure_count`, and resume rebuilds expansions by
+  replaying `tasks_expanded` events.
+
+### Fixed
+
+- `validate-plugin-layout` now checks the complete runtime layout: the
+  `requiredFiles` list grew from 12 to 26 entries, adding `package.json`, the
+  `core.js` facade, and every v0.6.0 `scripts/lib` module. A missing module
+  previously crashed the CLI with `ERR_MODULE_NOT_FOUND` (fail-closed but
+  unstructured) instead of appearing in the structured `missing` report; a
+  negative regression test (`tests/plugin-layout.test.js`) pins the new
+  behavior.
+- The V7 route co-activation check now inspects reachable resolutions only,
+  matching V6 and the runtime `cases[value] ?? default` semantics. A `default`
+  list that is unreachable because every route value has an explicit case no
+  longer triggers false plan rejections of safe `prompt_template` /
+  `foreach.items` references.
+- `workflow.schema.json` now forbids `gates`, `gate_feedback_tail_bytes`,
+  `route`, and `foreach` for local task kinds (in addition to
+  `model`/`effort`/`profile`/`output_schema`), closing a schema-vs-runtime
+  divergence where the JSON Schema accepted fields the runtime rejects.
+
+### Documentation
+
+- Root READMEs (`README.md`, `README.ja.md`), the plugin README, SKILL.md,
+  the MCP tool descriptions, and `workflow.schema.json` document the v2
+  spec surface: `output_schema`, templates, `gates`, `route`, `foreach`,
+  saved workflows, YAML authoring, the new statuses/events, and the
+  compatibility break. SKILL.md's planning rules now cover route design
+  guidance (multi-value branching instead of OK/ABORT), the
+  depends_on-closure rule for template references, gate disclosure, and
+  foreach budgeting.
+
+### Known limitations
+
+- A retry-pending task that settles in the same scheduler drain window as a
+  sibling can let downstream tasks be skipped before the retry actually runs
+  (pre-existing fold-order race). Recover with
+  `resume --resume-failed`.
+- Plain `resume` requeues only tasks that were `running` when the runner
+  stopped; terminal `gate_failed`/`failed` tasks need `--resume-failed`
+  (pre-existing).
+
 ## v0.5.0 - 2026-06-12
 
 ### Changed (breaking for new plans)

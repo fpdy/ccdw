@@ -13,13 +13,14 @@
     "updated_at",
     "tasks",
     "attempts",
+    "expanded_tasks",
     "artifacts",
     "locks",
     "budget_usage",
     "event_log_offset"
   ],
   "properties": {
-    "schema_version": { "type": "string" },
+    "schema_version": { "const": "dynamic-workflows.v2" },
     "run_id": { "type": "string" },
     "goal_id": { "type": ["string", "null"] },
     "status": {
@@ -37,8 +38,36 @@
     "current_phase": { "type": ["string", "null"] },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" },
-    "tasks": { "type": "object" },
+    "tasks": {
+      "type": "object",
+      "description": "task_id -> task state record. Each record's `status` is one of: queued, running, succeeded, failed, timed_out, cancelled, schema_violation, skipped, gate_failed, skipped_by_route, expanded. `expanded` (foreach parents, F6) is deliberately non-terminal; succeeded and skipped_by_route are the terminal statuses that satisfy dependencies without failing the run. Documentation-level: this schema is not enforced at runtime (validateRunState checks the top-level shape only).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed",
+              "timed_out",
+              "cancelled",
+              "schema_violation",
+              "skipped",
+              "gate_failed",
+              "skipped_by_route",
+              "expanded"
+            ]
+          }
+        }
+      }
+    },
     "attempts": { "type": "object" },
+    "expanded_tasks": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Foreach child task definitions appended at expansion time (F6, spec §6.2): `<parent>.<index>` ids derived from the parent definition plus one resolved item each. Every entry has a matching state.tasks record; resume rebuilds missing entries by replaying tasks_expanded events."
+    },
     "artifacts": { "type": "array" },
     "locks": { "type": "object" },
     "budget_usage": { "type": "object" },

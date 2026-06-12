@@ -15,19 +15,21 @@ import fs from "node:fs";
 
 const serverInfo = {
   name: "dynamic-workflows",
-  version: "0.5.0",
+  version: "0.6.0",
 };
 
 const tools = [
   {
     name: "dynamic_workflows_plan",
     description:
-      "Validate and register a workflow run, leaving it awaiting approval. Pass `spec` (a WorkflowSpec JSON object you author: phases[], tasks[] with self-contained prompt_template per task, depends_on, budgets) to run your own plan; tasks with kind starting with \"codex\" execute as real codex exec subagents, kinds starting with \"claude\" as claude -p subagents, and other kinds as deterministic local tasks. Task-level `model` applies to codex and claude, `profile` applies only to codex, and `effort` applies only to claude; unsupported combinations are rejected for new plans and shown in the approval summary when present. Without `spec`, a fixed local explore/verify/synthesize template is planned (a smoke-test scaffold, not a real decomposition). Set dryRun:true to validate a spec without creating a run. This tool never overwrites an existing runId; replacing a non-running run requires the CLI's `plan --force`. Returns the approval summary (including advisory_fields, the spec fields the runner records but does not enforce); render it to the user before approving.",
+      "Validate and register a workflow run, leaving it awaiting approval. Pass `spec` (a WorkflowSpec JSON object you author, schema dynamic-workflows.v2: phases[], tasks[] with self-contained prompt_template per task, depends_on, budgets) to run your own plan; tasks with kind starting with \"codex\" execute as real codex exec subagents, kinds starting with \"claude\" as claude -p subagents, and other kinds as deterministic local tasks. v2 task fields: `output_schema` (restricted typed-output subset; keywords type/properties/items/enum/description/title only, required/additionalProperties are runner-generated, domain output lands in result.output), `gates` (argv command + timeout_ms verification commands run after a schema-valid result; failure -> retryable gate_failed with {{gate_feedback}} injected on retry; gates run unsandboxed with cwd=workspace root and an env allowlist, and appear verbatim in the approval summary), `route` (schema-enforced enum branching with required default; unselected case tasks become skipped_by_route, which satisfies dependencies without failing the run), and `foreach` (bounded fan-out over a producer array; max_items is required, counted against max_agents at plan time, and exceeding it fails the parent; aggregate in result.output.results). prompt_template supports statically validated {{...}} references ({{objective}}, {{tasks.<id>.result.<dotpath>}} with the producer in depends_on, {{item}}, {{gate_feedback}}, {{inputs.*}} (saved workflows only; plain specs reject it)). The v1 fields expected_output_schema, verification_required, verification_policy, and fanout_source were removed and are rejected. Alternatively pass `workflow` (a saved template under <CCDW_HOME>/workflows) plus typed `inputs` instead of `spec`. Without `spec`/`workflow`, a fixed local explore/verify/synthesize template is planned (a smoke-test scaffold, not a real decomposition). Set dryRun:true to validate a spec without creating a run. This tool never overwrites an existing runId; replacing a non-running run requires the CLI's `plan --force`. YAML authoring is CLI-only; `spec` stays a JSON object here. Returns the approval summary (including gate commands, foreach budget estimates, saved-workflow provenance, and advisory_fields — the spec fields the runner records but does not enforce); render it to the user before approving.",
     inputSchema: {
       type: "object",
       properties: {
         objective: { type: "string", description: "Task objective (required unless spec.objective is set). Max 16000 chars." },
         spec: { type: "object", description: "Caller-authored WorkflowSpec JSON. Defaults are filled for omitted budget/policy fields." },
+        workflow: { type: "string", description: "Name of a saved workflow template under <CCDW_HOME>/workflows (mutually exclusive with spec)." },
+        inputs: { type: "object", description: "Typed input values for the saved workflow's declared inputs (requires workflow)." },
         workspace: { type: "string", description: "Workspace root the workers read (defaults to the server cwd)." },
         runRoot: { type: "string" },
         runId: { type: "string", description: "Optional run id matching ^[A-Za-z0-9._-]{1,64}$." },
@@ -66,7 +68,7 @@ const tools = [
   {
     name: "dynamic_workflows_resume",
     description:
-      "Resume a paused or crashed run (re-queues interrupted tasks, reuses completed results). Pass resumeFailed:true to retry the failed and skipped tasks of a failed run, or of a completed run whose outcome is partial. Refuses while an orchestrator is alive.",
+      "Resume a paused or crashed run (re-queues interrupted tasks, reuses completed results). Pass resumeFailed:true to requeue the failed, gate_failed, timed_out, schema_violation, and skipped tasks of a failed run, or of a completed run whose outcome is partial. skipped_by_route tasks are never requeued (route resolutions are final). Run directories planned before schema v2 are rejected (re-plan required). Refuses while an orchestrator is alive.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -105,7 +107,7 @@ const tools = [
   },
   {
     name: "dynamic_workflows_events",
-    description: "Incrementally read the run's append-only event log. Pass the previous next_offset as sinceOffset to get only new events.",
+    description: "Incrementally read the run's append-only event log. Pass the previous next_offset as sinceOffset to get only new events. v2 adds gate_started/gate_result (verification commands), route_resolved (branch selection), tasks_expanded (foreach fan-out), tasks_expanded_replayed (expansion replayed from the event log on resume), and template_resolution_failed events.",
     inputSchema: {
       type: "object",
       required: ["runDir"],
@@ -393,6 +395,8 @@ async function callTool(name, args) {
       return planWorkflow({
         objective: args.objective,
         spec: args.spec,
+        workflow: args.workflow,
+        inputs: args.inputs,
         workspace: args.workspace,
         runRoot: args.runRoot,
         runId: args.runId,

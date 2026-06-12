@@ -1,6 +1,6 @@
 import { CLAUDE_EFFORT_LEVELS, pushSafeWorkerArg } from "./executor-contract.js";
 import { startNdjsonProcess } from "./process-runner.js";
-import { WORKER_OUTPUT_SCHEMA } from "./codex-executor.js";
+import { WORKER_OUTPUT_SCHEMA } from "./output-schema.js";
 
 export function resolveClaudeBin(env = process.env) {
   const candidate = env.CCDW_CLAUDE_BIN?.trim();
@@ -33,7 +33,7 @@ export function buildClaudeSandboxSettings({ workflow }) {
   };
 }
 
-export function buildClaudeExecArgs({ workflow, task, settingsPath }) {
+export function buildClaudeExecArgs({ workflow, task, settingsPath, workerSchema = WORKER_OUTPUT_SCHEMA }) {
   const policy = workflow.workspace_policy ?? {};
   const writeScope = Array.isArray(policy.write_scope) ? policy.write_scope : [];
   const workspaceWrite = writeScope.includes("workspace");
@@ -45,7 +45,7 @@ export function buildClaudeExecArgs({ workflow, task, settingsPath }) {
     "--safe-mode",
     "--no-session-persistence",
     "--json-schema",
-    JSON.stringify(WORKER_OUTPUT_SCHEMA),
+    JSON.stringify(workerSchema),
     "--settings",
     settingsPath,
     // Empty value fully excludes user/project/local settings so ambient
@@ -88,8 +88,8 @@ export function buildClaudeExecArgs({ workflow, task, settingsPath }) {
     }
     args.push("--effort", task.effort);
   }
-  // task.profile is codex-only. Stored pre-v0.5.0 runs may carry it, so
-  // runtime keeps ignoring it; new plans reject it in strict validation.
+  // task.profile is codex-only; strict validation rejects it for claude tasks,
+  // and the runtime ignores it defensively.
   return args;
 }
 

@@ -139,11 +139,6 @@ function workflowEventTypes(runDir) {
   return readWorkflowEvents({ runDir }).events.map((event) => event.type);
 }
 
-function artifactDirForTask(runDir, state, taskId) {
-  const attemptId = state.tasks[taskId].attempts[0];
-  return path.join(runDir, state.attempts[attemptId].artifact_dir);
-}
-
 test("planWorkflow creates an approval-gated run directory", () => {
   const workspace = makeTempWorkspace();
   const result = planWorkflow({
@@ -453,7 +448,9 @@ test("codex executor runs a worker through the fake codex binary", async () => {
   const state = readRunState(planned.run_dir);
   const attemptId = state.tasks.t1.attempts[0];
   assert.match(state.attempts[attemptId].thread_id, /^fake-thread-/);
-  assert.ok(fs.existsSync(path.join(planned.run_dir, "worker-output.schema.json")));
+  const attemptDir = path.join(planned.run_dir, state.attempts[attemptId].artifact_dir);
+  const writtenSchema = readJsonFile(path.join(attemptDir, "worker-output.schema.json"));
+  assert.deepEqual(writtenSchema, WORKER_OUTPUT_SCHEMA);
 });
 
 test("scheduler runs codex tasks concurrently up to max_concurrency", async () => {
@@ -1093,23 +1090,59 @@ test("approval summary reports advisory fields and only enforced budgets", () =>
 
   const summary = planned.approval.summary;
   assert.deepEqual(summary.budget, { max_tokens: 100000, max_duration_ms: 300000 });
-  assert.ok(summary.advisory_fields.fields.includes("max_cost"));
-  assert.ok(summary.advisory_fields.fields.includes("max_retries"));
-  assert.ok(summary.advisory_fields.fields.includes("verification_policy"));
+  assert.deepEqual(summary.advisory_fields.fields, ["max_cost", "max_retries", "max_no_progress_iterations"]);
 });
 
-test("strict validation applies at plan time only; stored specs re-read leniently", () => {
+test("stored specs are re-validated strictly on every read", () => {
   const workspace = makeTempWorkspace();
-  const planned = planWorkflow({ objective: "Legacy spec values stay readable", workspace });
+  const planned = planWorkflow({ objective: "Stored specs stay strict", workspace });
 
-  const specPath = path.join(planned.run_dir, "workflow.yaml");
-  const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
-  spec.phases[0].completion_condition = "any";
-  spec.tasks[0].stop_condition = "never";
-  fs.writeFileSync(specPath, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
+  mutateWorkflowFile(planned.run_dir, (spec) => {
+    spec.phases[0].completion_condition = "any";
+    spec.tasks[0].stop_condition = "never";
+  });
 
-  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
-  assert.equal(validateRunDirectory({ runDir: planned.run_dir }).valid, true);
+  assert.throws(() => statusWorkflow({ runDir: planned.run_dir }), /Run directory validation failed/);
+  const validation = validateRunDirectory({ runDir: planned.run_dir });
+  assert.equal(validation.valid, false);
+  assert.ok(validation.errors.some((message) => message.includes("completion_condition")));
+  assert.ok(validation.errors.some((message) => message.includes("stop_condition")));
+});
+
+test("plan rejects spec fields removed in schema v2 with per-field errors", () => {
+  const workspace = makeTempWorkspace();
+  const result = planWorkflow({
+    workspace,
+    dryRun: true,
+    spec: codexSpec({
+      objective: "Reject removed v1 fields",
+      phases: [{ phase_id: "p1", tasks: ["t1"], verification_required: true }],
+      tasks: [
+        {
+          task_id: "t1",
+          phase_id: "p1",
+          kind: "codex_agent",
+          role: "w",
+          prompt_template: "x",
+          verification_required: false,
+          expected_output_schema: "WorkerResult",
+          fanout_source: null,
+        },
+      ],
+      verification_policy: { required: false },
+    }),
+  });
+
+  assert.equal(result.valid, false);
+  for (const fragment of [
+    "workflow.verification_policy was removed in schema v2",
+    "phase p1 verification_required was removed in schema v2",
+    "task t1 verification_required was removed in schema v2",
+    "task t1 expected_output_schema was removed in schema v2",
+    "task t1 fanout_source was removed in schema v2",
+  ]) {
+    assert.ok(result.errors.some((message) => message.includes(fragment)), fragment);
+  }
 });
 
 test("input_source outside the run and workspace records an audit warning event", async () => {
@@ -1504,15 +1537,17 @@ test("approval summary task entries have exactly the base key-set when no execut
   }
 });
 
-test("stored executor fields stay lenient for observability and validation", () => {
+test("stored executor field tampering is rejected by strict re-validation", () => {
   const workspace = makeTempWorkspace();
   const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
   mutateWorkflowFile(planned.run_dir, (spec) => {
     spec.tasks[0].effort = "high";
   });
 
-  assert.equal(statusWorkflow({ runDir: planned.run_dir }).status, "awaiting_approval");
-  assert.equal(validateRunDirectory({ runDir: planned.run_dir }).valid, true);
+  assert.throws(() => statusWorkflow({ runDir: planned.run_dir }), /Run directory validation failed/);
+  const validation = validateRunDirectory({ runDir: planned.run_dir });
+  assert.equal(validation.valid, false);
+  assert.ok(validation.errors.some((message) => message.includes("effort is not supported for codex tasks")));
 });
 
 test("hash-only spec tamper is still observable and cancellable", () => {
@@ -1705,77 +1740,53 @@ test("executor argv builders route model profile and effort by executor", () => 
   );
 });
 
-test("codex runtime guard fails stored unsafe model before spawn-only side effects", async () => {
+test("stored unsafe codex model is rejected by strict re-validation before any spawn", async () => {
   const workspace = makeTempWorkspace();
-  const outside = path.join(makeTempWorkspace(), "external-input.json");
-  fs.writeFileSync(outside, "{}\n", "utf8");
-  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec({ input_source: outside }) });
+  const planned = planWorkflow({ workspace, spec: singleCodexTaskSpec() });
   mutateWorkflowFile(planned.run_dir, (spec) => {
     spec.tasks[0].model = "-hostile";
   });
   refreshStoredSpecHash(planned.run_dir);
   const tracePath = path.join(workspace, "codex-spawn-trace.jsonl");
 
-  const failed = await withEnvAsync(
-    { CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_TRACE_PATH: tracePath },
-    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  await assert.rejects(
+    () =>
+      withEnvAsync({ CCDW_CODEX_BIN: fakeCodexBin, CCDW_FAKE_TRACE_PATH: tracePath }, () =>
+        runWorkflow({ runDir: planned.run_dir, approve: true }),
+      ),
+    (error) => error.details.errors.some((message) => message.includes("task t1 model must match")),
   );
 
-  assert.equal(failed.status, "failed");
-  assert.equal(failed.tasks.t1.status, "failed");
   assert.ok(!fs.existsSync(tracePath));
-  assert.ok(!fs.existsSync(path.join(planned.run_dir, "worker-output.schema.json")));
-  assert.ok(!workflowEventTypes(planned.run_dir).includes("input_path_warning"));
-
-  const state = readRunState(planned.run_dir);
-  const attemptDir = artifactDirForTask(planned.run_dir, state, "t1");
-  assert.ok(!fs.existsSync(path.join(attemptDir, "codex-events.jsonl")));
-  assert.equal(state.attempts[state.tasks.t1.attempts[0]].status, "failed");
-
-  // pid stays null: startCodexExec is never reached because buildCodexExecArgs
-  // throws before the child process is spawned.
-  assert.equal(state.attempts[state.tasks.t1.attempts[0]].pid, null);
-  // launch_requested is emitted in launchTask() before runAttempt() is called,
-  // so it IS present even though no binary was spawned.
-  assert.ok(workflowEventTypes(planned.run_dir).includes("launch_requested"));
+  assert.equal(readRunState(planned.run_dir).status, "awaiting_approval");
+  const eventTypes = workflowEventTypes(planned.run_dir);
+  assert.ok(!eventTypes.includes("launch_requested"));
+  assert.ok(!eventTypes.includes("run_started"));
 });
 
-test("claude runtime guard fails stored invalid effort before spawn-only side effects", async () => {
+test("stored invalid claude effort is rejected by strict re-validation before any spawn", async () => {
   const workspace = makeTempWorkspace();
-  const outside = path.join(makeTempWorkspace(), "external-input.json");
-  fs.writeFileSync(outside, "{}\n", "utf8");
-  const planned = planWorkflow({
-    workspace,
-    spec: singleClaudeTaskSpec({ input_source: outside, effort: "high" }),
-  });
+  const planned = planWorkflow({ workspace, spec: singleClaudeTaskSpec({ effort: "high" }) });
   mutateWorkflowFile(planned.run_dir, (spec) => {
     spec.tasks[0].effort = "extreme";
   });
   refreshStoredSpecHash(planned.run_dir);
   const tracePath = path.join(workspace, "claude-spawn-trace.jsonl");
 
-  const failed = await withEnvAsync(
-    { CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_TRACE_PATH: tracePath },
-    () => runWorkflow({ runDir: planned.run_dir, approve: true }),
+  await assert.rejects(
+    () =>
+      withEnvAsync({ CCDW_CLAUDE_BIN: fakeClaudeBin, CCDW_FAKE_TRACE_PATH: tracePath }, () =>
+        runWorkflow({ runDir: planned.run_dir, approve: true }),
+      ),
+    (error) => error.details.errors.some((message) => message.includes("task t1 effort must be one of")),
   );
 
-  assert.equal(failed.status, "failed");
-  assert.equal(failed.tasks.t1.status, "failed");
   assert.ok(!fs.existsSync(tracePath));
   assert.ok(!fs.existsSync(path.join(planned.run_dir, "claude-settings.json")));
-  assert.ok(!workflowEventTypes(planned.run_dir).includes("input_path_warning"));
-
-  const state = readRunState(planned.run_dir);
-  const attemptDir = artifactDirForTask(planned.run_dir, state, "t1");
-  assert.ok(!fs.existsSync(path.join(attemptDir, "claude-events.jsonl")));
-  assert.equal(state.attempts[state.tasks.t1.attempts[0]].status, "failed");
-
-  // pid stays null: startClaudeExec is never reached because buildClaudeExecArgs
-  // throws before the child process is spawned.
-  assert.equal(state.attempts[state.tasks.t1.attempts[0]].pid, null);
-  // launch_requested is emitted in launchTask() before runAttempt() is called,
-  // so it IS present even though no binary was spawned.
-  assert.ok(workflowEventTypes(planned.run_dir).includes("launch_requested"));
+  assert.equal(readRunState(planned.run_dir).status, "awaiting_approval");
+  const eventTypes = workflowEventTypes(planned.run_dir);
+  assert.ok(!eventTypes.includes("launch_requested"));
+  assert.ok(!eventTypes.includes("run_started"));
 });
 
 test("codex model and profile flow from spec to argv and normalized result", async () => {
@@ -1873,7 +1884,16 @@ test("workflow schema executor contract stays pinned to shared constants", () =>
       },
       then: {
         not: {
-          anyOf: [{ required: ["model"] }, { required: ["effort"] }, { required: ["profile"] }],
+          anyOf: [
+            { required: ["model"] },
+            { required: ["effort"] },
+            { required: ["profile"] },
+            { required: ["output_schema"] },
+            { required: ["gates"] },
+            { required: ["gate_feedback_tail_bytes"] },
+            { required: ["route"] },
+            { required: ["foreach"] },
+          ],
         },
       },
     },
@@ -1885,9 +1905,9 @@ test("dynamic workflows release version surfaces are aligned", () => {
   const pluginJson = readJsonFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"));
   const mcpSource = fs.readFileSync(path.join(pluginRoot, "scripts", "dynamic-workflows-mcp.js"), "utf8");
 
-  assert.equal(packageJson.version, "0.5.0");
-  assert.equal(pluginJson.version, "0.5.0");
-  assert.match(mcpSource, /version: "0\.5\.0"/);
+  assert.equal(packageJson.version, "0.6.0");
+  assert.equal(pluginJson.version, "0.6.0");
+  assert.match(mcpSource, /version: "0\.6\.0"/);
 });
 
 // Case 1: dispatch routing.

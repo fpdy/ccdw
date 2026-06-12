@@ -20,6 +20,15 @@ const resultStatus = process.env.CCDW_FAKE_RESULT_STATUS ?? "succeeded";
 const failMarker = process.env.CCDW_FAKE_FAIL_MARKER;
 const invalidJson = process.env.CCDW_FAKE_INVALID_JSON === "1";
 const isError = process.env.CCDW_FAKE_IS_ERROR === "1";
+// When set (JSON string), emit the typed-form envelope v2 with this payload as
+// `output` instead of the default-form fields.
+const typedOutputJson = process.env.CCDW_FAKE_TYPED_OUTPUT;
+// When set, add a `route` field with this value to the envelope (F4 routing
+// tasks). Non-route tasks in the same run ignore the extra field harmlessly.
+const routeValue = process.env.CCDW_FAKE_ROUTE_VALUE;
+// When "1", emit worker-chosen task_id/attempt_id fields in the envelope:
+// the runner-injected identity must win over them (C-1 spoofing guard).
+const spoofIds = process.env.CCDW_FAKE_SPOOF_IDS === "1";
 const schemaRetryExhausted = process.env.CCDW_FAKE_SCHEMA_RETRY_EXHAUSTED === "1";
 const totalCostUsd = Number(process.env.CCDW_FAKE_TOTAL_COST ?? 0.0123);
 const cacheCreationTokens = Number(process.env.CCDW_FAKE_CACHE_CREATION ?? 0);
@@ -110,16 +119,32 @@ setTimeout(() => {
     // No structured_output at all; the human text is not parseable JSON.
     emit({ ...base, result: "this is not json" });
   } else {
-    const structuredOutput = {
-      status: resultStatus,
-      summary: `fake claude worker handled: ${prompt.slice(0, 60)} model=${requestedModel} effort=${requestedEffort ?? ""}`,
-      findings: [],
-      errors: resultStatus === "failed" ? ["fake failure"] : [],
-      evidence: [],
-      modified_files: [],
-      commands_run: [],
-      artifacts: [],
-    };
+    const summary = `fake claude worker handled: ${prompt.slice(0, 60)} model=${requestedModel} effort=${requestedEffort ?? ""}`;
+    const routeFields = routeValue != null ? { route: routeValue } : {};
+    const spoofFields = spoofIds
+      ? { task_id: "spoofed-task", attempt_id: "spoofed-attempt" }
+      : {};
+    const structuredOutput = typedOutputJson
+      ? {
+          ...spoofFields,
+          status: resultStatus,
+          summary,
+          errors: resultStatus === "failed" ? ["fake failure"] : [],
+          ...routeFields,
+          output: JSON.parse(typedOutputJson),
+        }
+      : {
+          ...spoofFields,
+          status: resultStatus,
+          summary,
+          findings: [],
+          errors: resultStatus === "failed" ? ["fake failure"] : [],
+          evidence: [],
+          modified_files: [],
+          commands_run: [],
+          artifacts: [],
+          ...routeFields,
+        };
     emit({
       ...base,
       result: structuredOutput.summary,
