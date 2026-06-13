@@ -7,8 +7,8 @@
 このリポジトリは、現在手元で使うCodexエージェント関連ファイルと
 Dynamic Workflows拡張機能の実装を管理しています。
 
-Dynamic Workflowsは、作業計画を本物の `codex exec` または `claude -p`
-サブエージェントで実行する手元の宣言的な作業手順実行に変換します。呼び出し側エージェントがWorkflowSpec
+Dynamic Workflowsは、作業計画を本物の `codex exec`、`claude -p`、または
+`opencode acp` サブエージェントで実行する手元の宣言的な作業手順実行に変換します。呼び出し側エージェントがWorkflowSpec
 (JSON。CLIからはYAMLも可) を書き、実行プログラムがそれを検証し、上限を超えたら安全側で停止する
 予算管理のもとでタスクを並列スケジュールします。作業手順の仕様、実行状態、
 追記型の処理記録、作業成果物を保存し、承認、実行、監視、再開、取り消しが
@@ -48,7 +48,7 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
 - `events.ndjson`: 追記型の処理記録と監査記録。
 - `artifacts/`: 構造化された作業結果と試行ごとの生出力。
 
-実行処理は3種類組み込まれています。
+実行処理は4種類組み込まれています。
 
 - **codex実行**: `kind` が `codex` で始まるタスクは `codex exec` の
   子プロセスとして実行されます。JSONLイベントストリーム、スキーマで強制した
@@ -66,10 +66,22 @@ Dynamic Workflows拡張機能は `plugins/dynamic-workflows` にあります。
   `ANTHROPIC_API_KEY` を設定してください)。ユーザー設定の `model` も
   適用されないため、タスクの `model` フィールドを使ってください。claudeタスクを
   含む作業手順では `workspace_policy.network:true` は計画時に拒否されます。
+- **acp_opencode実行**: `kind` が `acp_opencode` と完全一致するタスク
+  (他の `acp*` 値は計画時に拒否) は、ACP (stdio上のnd-JSON-RPC) で駆動する
+  `opencode acp` の子プロセスとして実行されます (1試行 = 1プロセス)。
+  タスクの `model` は必須です (ACPモデルID。例:
+  `openrouter/anthropic/claude-haiku-4.5`)。`output_schema`、`route`、
+  `effort`、`profile`、`network: true` は拒否されます。OSレベルの
+  サンドボックスはなく、執行は注入したopencodeのpermission設定と、
+  すべてのpermission要求をccdwが自動拒否することのみで行います。書き込み
+  スコープではネットワーク隔離は保証されません — 承認サマリに明示されます。
+  トークン使用量はACPの `PromptResponse.usage` から実行予算に計上されます。
+  バイナリは `CCDW_OPENCODE_BIN` で差し替えられます (絶対パス推奨)。
 - **ローカル実行**: `local_*` のタスク種別は毎回同じ結果になる手元の実行処理で、
   既定テンプレートとテスト一式が使います。LLMセッションは起動しません。
 
-タスクレベルの `model` はcodexタスクとclaudeタスクで対応しています。`profile` はcodex専用、
+タスクレベルの `model` はcodexタスクとclaudeタスクで対応し、acp_opencodeタスクでは
+必須です。`profile` はcodex専用、
 `effort` はclaude専用 (`low`、`medium`、`high`、`xhigh`、`max`) で、ローカルタスクは
 新しい計画で実行処理フィールドをすべて拒否します。承認サマリには、これらのフィールドが
 指定されている場合にその値が表示されます。argvとして安全でない格納値は、
@@ -138,9 +150,11 @@ worker起動では強制できないため実行側が拒否します。
 - 拡張機能のテストスクリプトを実行するためのnpm。
 - codexタスクを使う作業手順では、PATH上の `codex` CLI。
 - claudeタスクを使う作業手順では、PATH上の `claude` CLI (2.1.x以降)。
+- `acp_opencode` タスクを使う作業手順では、PATH上の `opencode` CLI、または
+  `CCDW_OPENCODE_BIN` で指定した絶対パスのopencodeバイナリ。
 
-テスト一式ではパッケージインストールは不要です。codex実行とclaude実行は同梱の
-擬似バイナリでテストされます。
+テスト一式ではパッケージインストールは不要です。codex実行、claude実行、ACP
+opencode実行は同梱の擬似バイナリでテストされます。
 
 ## はじめに
 

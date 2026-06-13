@@ -17,6 +17,16 @@ import {
   startClaudeExec,
 } from "./claude-executor.js";
 import {
+  OPENCODE_CONFIG_FILE,
+  OPENCODE_XDG_CONFIG_DIR,
+  buildAcpWorkerEnv,
+  buildOpencodeWorkerConfig,
+  extractFinalMessageText,
+  probeOpencodeVersion,
+  resolveOpencodeBin,
+  startAcpExec,
+} from "./acp-executor.js";
+import {
   CLAUDE_SETTINGS_FILE,
   NON_FAILURE_TERMINAL_TASK_STATUSES,
   PERMANENT_FAILURE_TASK_STATUSES,
@@ -169,6 +179,7 @@ export async function executeApprovedRun(runDir, workflow, state, options = {}) 
 
   const abortInFlight = async (taskStatus, reason) => {
     runContext.aborting = true;
+    const abortedTaskIds = [...inFlight.keys()];
     for (const entry of inFlight.values()) {
       entry.cancel?.();
     }
@@ -180,7 +191,7 @@ export async function executeApprovedRun(runDir, workflow, state, options = {}) 
     }
     runContext.sealed = true;
     const timestamp = nowIso();
-    for (const taskId of inFlight.keys()) {
+    for (const taskId of abortedTaskIds) {
       if (state.tasks[taskId].status === "running") {
         state.tasks[taskId].status = taskStatus;
         state.tasks[taskId].updated_at = timestamp;
@@ -625,7 +636,7 @@ export async function executeApprovedRun(runDir, workflow, state, options = {}) 
 
   const launchTask = (task) => {
     const executorKind = resolveExecutorKind(task.kind);
-    const isSubagent = executorKind === "codex" || executorKind === "claude";
+    const isSubagent = executorKind === "codex" || executorKind === "claude" || executorKind === "acp";
     // The prompt template is rendered before any attempt state exists: local
     // attempts never consume the prompt, and for subagents a render failure is
     // a contract violation (templates are statically validated at plan time),
@@ -712,7 +723,9 @@ export async function executeApprovedRun(runDir, workflow, state, options = {}) 
         ? () => runCodexAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, startedAt, runContext)
         : executorKind === "claude"
           ? () => runClaudeAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, startedAt, runContext)
-          : async () => runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir);
+          : executorKind === "acp"
+            ? () => runAcpAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, startedAt, runContext)
+            : async () => runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir);
     const promise = (async () => {
       try {
         await runAttempt();
@@ -918,6 +931,91 @@ function quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, atte
   });
 }
 
+// Shared terminal fold for subagent attempts: attempt status, task status, and
+// the worker_exited audit event stay in lockstep across executors. The closure
+// captures the worker outcome so every fold reports the same exit status,
+// thread id, and stderr tail regardless of which branch terminated the attempt.
+function createFinishAttempt(runDir, state, task, attemptId, attempt, outcome) {
+  return (attemptStatus, taskStatus, payload) => {
+    attempt.status = attemptStatus;
+    setTaskStatus(runDir, state, task.task_id, taskStatus, {
+      attempt_id: attemptId,
+      ...payload,
+    });
+    recordEvent(runDir, state, "worker_exited", {
+      task_id: task.task_id,
+      attempt_id: attemptId,
+      exit_status: outcome.exitCode,
+      stop_reason: attemptStatus,
+      thread_id: outcome.threadId,
+      stderr_tail: outcome.stderrTail ? outcome.stderrTail.slice(-1000) : "",
+    });
+  };
+}
+
+// Shared post-outcome acceptance pipeline (design §4.5): once an executor's
+// own success predicate accepted the worker's raw final message, the rest is
+// executor-independent — parse the message, overwrite the identity fields
+// (runner-injected identity wins: a worker emitting its own task_id or
+// attempt_id must not be able to spoof the persisted result identity),
+// re-validate (CLI-side schema enforcement, where it exists, is never trusted
+// on its own — defense in depth), quarantine violations, persist the accepted
+// result, then fold through gates into finishAttempt. Executor-specific
+// outcome folding (cancelled/timed_out/worker_failed and pre-folds like the
+// claude structured-output-retry quarantine) stays in each attempt runner.
+async function acceptWorkerMessage(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, attempt, outcome, finishAttempt, rawMessage) {
+  let workerOutput;
+  try {
+    workerOutput = JSON.parse(rawMessage);
+  } catch {
+    workerOutput = null;
+  }
+  const result = workerOutput == null
+    ? null
+    : { ...workerOutput, task_id: task.task_id, attempt_id: attemptId };
+  const resultErrors = result == null ? ["worker output was not valid JSON"] : validateWorkerResult(result, task);
+  const resultPath = resolveRunArtifactPath(runDir, task.task_id, "result.json");
+
+  if (resultErrors.length > 0) {
+    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, resultErrors);
+    return;
+  }
+
+  writeJson(resultPath, result);
+  state.tasks[task.task_id].result_path = toRunRelative(runDir, resultPath);
+  if (isPlainObject(task.route)) {
+    // Persisted alongside the accepted result so route resolution (which runs
+    // at fold time, after gates) and resume agree on the value (spec §5.1).
+    state.tasks[task.task_id].route_value = result.route;
+  }
+  if (!state.artifacts.includes(toRunRelative(runDir, resultPath))) {
+    state.artifacts.push(toRunRelative(runDir, resultPath));
+  }
+  for (const artifact of result.artifacts ?? []) {
+    if (!state.artifacts.includes(artifact)) {
+      state.artifacts.push(artifact);
+    }
+  }
+  recordEvent(runDir, state, "result_submitted", {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    schema_version: SCHEMA_VERSION,
+    result_path: toRunRelative(runDir, resultPath),
+    artifact_manifest: result.artifacts ?? [],
+    token_usage: outcome.usage,
+    thread_id: outcome.threadId,
+  });
+  if (result.status !== "succeeded") {
+    finishAttempt(result.status, "failed", { reason: "worker_reported_failure" });
+    return;
+  }
+  if (Array.isArray(task.gates) && task.gates.length > 0) {
+    await runGatePhase(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, finishAttempt);
+    return;
+  }
+  finishAttempt("succeeded", "succeeded", { reason: "completed" });
+}
+
 async function runCodexAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, runStartedAt, runContext) {
   // The schema file is per attempt: each task gets its own synthesized worker
   // schema (default or typed form), written after the argv guard passes.
@@ -993,21 +1091,7 @@ async function runCodexAttempt(runDir, workflow, state, task, renderedPrompt, at
   }
   attempt.completed_at = nowIso();
 
-  const finishAttempt = (attemptStatus, taskStatus, payload) => {
-    attempt.status = attemptStatus;
-    setTaskStatus(runDir, state, task.task_id, taskStatus, {
-      attempt_id: attemptId,
-      ...payload,
-    });
-    recordEvent(runDir, state, "worker_exited", {
-      task_id: task.task_id,
-      attempt_id: attemptId,
-      exit_status: outcome.exitCode,
-      stop_reason: attemptStatus,
-      thread_id: outcome.threadId,
-      stderr_tail: outcome.stderrTail ? outcome.stderrTail.slice(-1000) : "",
-    });
-  };
+  const finishAttempt = createFinishAttempt(runDir, state, task, attemptId, attempt, outcome);
 
   if (outcome.cancelled) {
     finishAttempt("cancelled", "cancelled", { reason: "cancelled" });
@@ -1031,58 +1115,7 @@ async function runCodexAttempt(runDir, workflow, state, task, renderedPrompt, at
     return;
   }
 
-  let workerOutput;
-  try {
-    workerOutput = JSON.parse(rawMessage);
-  } catch {
-    workerOutput = null;
-  }
-  // Runner-injected identity wins: a worker emitting its own task_id or
-  // attempt_id must not be able to spoof the persisted result identity.
-  const result = workerOutput == null
-    ? null
-    : { ...workerOutput, task_id: task.task_id, attempt_id: attemptId };
-  const resultErrors = result == null ? ["worker output was not valid JSON"] : validateWorkerResult(result, task);
-  const resultPath = resolveRunArtifactPath(runDir, task.task_id, "result.json");
-
-  if (resultErrors.length > 0) {
-    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, resultErrors);
-    return;
-  }
-
-  writeJson(resultPath, result);
-  state.tasks[task.task_id].result_path = toRunRelative(runDir, resultPath);
-  if (isPlainObject(task.route)) {
-    // Persisted alongside the accepted result so route resolution (which runs
-    // at fold time, after gates) and resume agree on the value (spec §5.1).
-    state.tasks[task.task_id].route_value = result.route;
-  }
-  if (!state.artifacts.includes(toRunRelative(runDir, resultPath))) {
-    state.artifacts.push(toRunRelative(runDir, resultPath));
-  }
-  for (const artifact of result.artifacts ?? []) {
-    if (!state.artifacts.includes(artifact)) {
-      state.artifacts.push(artifact);
-    }
-  }
-  recordEvent(runDir, state, "result_submitted", {
-    task_id: task.task_id,
-    attempt_id: attemptId,
-    schema_version: SCHEMA_VERSION,
-    result_path: toRunRelative(runDir, resultPath),
-    artifact_manifest: result.artifacts ?? [],
-    token_usage: outcome.usage,
-    thread_id: outcome.threadId,
-  });
-  if (result.status !== "succeeded") {
-    finishAttempt(result.status, "failed", { reason: "worker_reported_failure" });
-    return;
-  }
-  if (Array.isArray(task.gates) && task.gates.length > 0) {
-    await runGatePhase(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, finishAttempt);
-    return;
-  }
-  finishAttempt("succeeded", "succeeded", { reason: "completed" });
+  await acceptWorkerMessage(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, attempt, outcome, finishAttempt, rawMessage);
 }
 
 async function runClaudeAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, runStartedAt, runContext) {
@@ -1188,21 +1221,7 @@ async function runClaudeAttempt(runDir, workflow, state, task, renderedPrompt, a
   }
   state.budget_usage.cost += outcome.totalCostUsd;
 
-  const finishAttempt = (attemptStatus, taskStatus, payload) => {
-    attempt.status = attemptStatus;
-    setTaskStatus(runDir, state, task.task_id, taskStatus, {
-      attempt_id: attemptId,
-      ...payload,
-    });
-    recordEvent(runDir, state, "worker_exited", {
-      task_id: task.task_id,
-      attempt_id: attemptId,
-      exit_status: outcome.exitCode,
-      stop_reason: attemptStatus,
-      thread_id: outcome.threadId,
-      stderr_tail: outcome.stderrTail ? outcome.stderrTail.slice(-1000) : "",
-    });
-  };
+  const finishAttempt = createFinishAttempt(runDir, state, task, attemptId, attempt, outcome);
 
   if (outcome.cancelled) {
     finishAttempt("cancelled", "cancelled", { reason: "cancelled" });
@@ -1242,61 +1261,210 @@ async function runClaudeAttempt(runDir, workflow, state, task, renderedPrompt, a
     return;
   }
 
-  const rawMessage = outcome.lastAgentMessage;
-  let workerOutput;
-  try {
-    workerOutput = JSON.parse(rawMessage);
-  } catch {
-    workerOutput = null;
-  }
-  // Runner-injected identity wins: a worker emitting its own task_id or
-  // attempt_id must not be able to spoof the persisted result identity.
-  const result = workerOutput == null
-    ? null
-    : { ...workerOutput, task_id: task.task_id, attempt_id: attemptId };
-  // The CLI-side --json-schema enforcement is not trusted on its own; the
-  // worker output goes through the same validation as codex (defense in depth).
-  const resultErrors = result == null ? ["worker output was not valid JSON"] : validateWorkerResult(result, task);
-  const resultPath = resolveRunArtifactPath(runDir, task.task_id, "result.json");
+  await acceptWorkerMessage(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, attempt, outcome, finishAttempt, outcome.lastAgentMessage);
+}
 
-  if (resultErrors.length > 0) {
-    quarantineWorkerOutput(runDir, state, task, attemptId, attemptDir, attempt, rawMessage, resultErrors);
+// ACP opencode attempt runner (design §4.5). One attempt spawns one
+// `opencode acp` process that runs exactly one session/prompt turn; the
+// rendered prompt travels over the JSON-RPC stream (never argv), so the
+// launch_started event records the prompt.txt artifact instead.
+async function runAcpAttempt(runDir, workflow, state, task, renderedPrompt, attemptId, attemptDir, handle, runStartedAt, runContext) {
+  const framesPath = path.join(attemptDir, "acp-frames.jsonl");
+  const promptPath = path.join(attemptDir, "prompt.txt");
+  const bin = resolveOpencodeBin();
+  // Run-level isolation artifacts (Phase 0 recipe, design §4.4): the injected
+  // permission config plus an empty XDG config dir that blocks the global
+  // opencode config. Written once per run, like the claude settings file.
+  const configPath = path.join(runDir, OPENCODE_CONFIG_FILE);
+  const xdgConfigDir = path.join(runDir, OPENCODE_XDG_CONFIG_DIR);
+  if (!fs.existsSync(configPath)) {
+    writeJson(configPath, buildOpencodeWorkerConfig({ workflow }));
+  }
+  ensureDir(xdgConfigDir);
+  const workerEnv = buildAcpWorkerEnv({ configPath, xdgConfigDir });
+  const opencodeVersion = await probeOpencodeVersion({
+    bin,
+    cwd: workflow.workspace_policy.workspace_root,
+    env: workerEnv,
+  });
+  if (runContext.aborting || runContext.sealed) {
     return;
   }
+  const remainingMs = workflow.max_duration_ms - (Date.now() - runStartedAt);
+  const timeoutMs = Math.max(Math.min(task.timeout_ms ?? Infinity, remainingMs), 1000);
+  const inputPaths = resolveTaskInputs(runDir, workflow, state, task);
+  const prompt = buildWorkerPrompt({ workflow, task, runDir, inputPaths, instructions: renderedPrompt });
+  // R6 audit parity: the prompt never appears in argv, so the rendered text
+  // is persisted as an attempt artifact instead.
+  fs.writeFileSync(promptPath, prompt, "utf8");
 
-  writeJson(resultPath, result);
-  state.tasks[task.task_id].result_path = toRunRelative(runDir, resultPath);
-  if (isPlainObject(task.route)) {
-    // Persisted alongside the accepted result so route resolution (which runs
-    // at fold time, after gates) and resume agree on the value (spec §5.1).
-    state.tasks[task.task_id].route_value = result.route;
-  }
-  if (!state.artifacts.includes(toRunRelative(runDir, resultPath))) {
-    state.artifacts.push(toRunRelative(runDir, resultPath));
-  }
-  for (const artifact of result.artifacts ?? []) {
-    if (!state.artifacts.includes(artifact)) {
-      state.artifacts.push(artifact);
-    }
-  }
-  recordEvent(runDir, state, "result_submitted", {
+  const attempt = state.attempts[attemptId];
+  attempt.status = "running";
+  attempt.started_at = nowIso();
+  attempt.opencode_version = opencodeVersion.version;
+  attempt.opencode_version_probe_status = opencodeVersion.status;
+
+  // Telemetry caps (review hardening): the frames file stops growing at
+  // 16 MiB per attempt (one {"truncated":true} sentinel line marks the cut),
+  // and at most 20 permission_request events are recorded — a flood beyond
+  // that folds into a single permission_request_flood summary at attempt end.
+  const MAX_FRAMES_BYTES = 16 * 1024 * 1024;
+  const MAX_PERMISSION_EVENTS = 20;
+  let framesBytes = 0;
+  let framesTruncated = false;
+  let permissionRequestCount = 0;
+
+  const exec = startAcpExec({
+    bin,
+    cwd: workflow.workspace_policy.workspace_root,
+    env: workerEnv,
+    prompt,
+    modelId: task.model,
+    timeoutMs,
+    onEvent: (frame) => {
+      if (!framesTruncated) {
+        try {
+          const line = `${JSON.stringify(frame)}\n`;
+          if (framesBytes + Buffer.byteLength(line, "utf8") > MAX_FRAMES_BYTES) {
+            framesTruncated = true;
+            fs.appendFileSync(framesPath, '{"truncated":true}\n', "utf8");
+          } else {
+            framesBytes += Buffer.byteLength(line, "utf8");
+            fs.appendFileSync(framesPath, line, "utf8");
+          }
+        } catch {
+          // Telemetry capture is best-effort.
+        }
+      }
+      if (runContext.sealed) {
+        return;
+      }
+      if (frame.dir === "meta" && frame.permissionRequest) {
+        // D8: permission requests are auto-denied by the executor; the
+        // request and the deterministic answer are part of the audit trail.
+        permissionRequestCount += 1;
+        if (permissionRequestCount <= MAX_PERMISSION_EVENTS) {
+          recordEvent(runDir, state, "permission_request", {
+            task_id: task.task_id,
+            attempt_id: attemptId,
+            tool_call: frame.permissionRequest.toolCall ?? null,
+            options_offered: frame.permissionRequest.optionsOffered ?? [],
+            selected: frame.permissionRequest.selected ?? null,
+          });
+        }
+      }
+    },
+  });
+  attempt.pid = exec.pid;
+  handle.cancel = exec.cancel;
+  recordEvent(runDir, state, "launch_started", {
     task_id: task.task_id,
     attempt_id: attemptId,
-    schema_version: SCHEMA_VERSION,
-    result_path: toRunRelative(runDir, resultPath),
-    artifact_manifest: result.artifacts ?? [],
-    token_usage: outcome.usage,
-    thread_id: outcome.threadId,
+    worker_id: `acp:${exec.pid ?? "unknown"}`,
+    command: [bin, "acp"],
+    opencode_version: opencodeVersion.version,
+    opencode_version_probe_status: opencodeVersion.status,
+    prompt_artifact: "prompt.txt",
+    artifact_directory: toRunRelative(runDir, attemptDir),
+    timeout_ms: timeoutMs,
   });
-  if (result.status !== "succeeded") {
-    finishAttempt(result.status, "failed", { reason: "worker_reported_failure" });
+
+  const outcome = await exec.promise;
+  if (runContext.sealed) {
+    // The orchestrator already aborted and folded this attempt.
     return;
   }
-  if (Array.isArray(task.gates) && task.gates.length > 0) {
-    await runGatePhase(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, finishAttempt);
+  attempt.completed_at = nowIso();
+  attempt.thread_id = outcome.threadId;
+
+  // Single budget accounting point (D7-r2): usage arrives normalized on the
+  // outcome (PromptResponse.usage), so it folds once at outcome time — the
+  // acp counterpart of codex turn.completed / claude result accounting.
+  // Cached reads stay uncounted, same as both other executors.
+  const usage = outcome.usage ?? {};
+  const tokens =
+    (Number(usage.input_tokens) || 0) +
+    (Number(usage.output_tokens) || 0) +
+    (Number(usage.reasoning_output_tokens) || 0);
+  state.budget_usage.tokens += tokens;
+  recordEvent(runDir, state, "progress", {
+    task_id: task.task_id,
+    attempt_id: attemptId,
+    token_usage: usage,
+    last_activity_at: nowIso(),
+  });
+
+  // Permission flood summary (cap above): the individual events stopped at
+  // the cap, so the total request count is preserved for audit here.
+  if (permissionRequestCount > MAX_PERMISSION_EVENTS) {
+    recordEvent(runDir, state, "permission_request_flood", {
+      task_id: task.task_id,
+      attempt_id: attemptId,
+      total_requests: permissionRequestCount,
+    });
+  }
+
+  const finishAttempt = createFinishAttempt(runDir, state, task, attemptId, attempt, outcome);
+
+  // cancelled is decided by the ccdw cancel flag alone: a cancelled turn can
+  // still resolve with stopReason end_turn (Phase 0 #7 trap).
+  if (outcome.cancelled) {
+    finishAttempt("cancelled", "cancelled", { reason: "cancelled" });
     return;
   }
-  finishAttempt("succeeded", "succeeded", { reason: "completed" });
+  if (outcome.timedOut) {
+    finishAttempt("timed_out", "timed_out", { reason: "timeout", timeout_ms: timeoutMs });
+    return;
+  }
+  // session/set_model failure is the only deterministic guard against the
+  // unauthenticated fallback model, which still exits 0 with end_turn
+  // (Phase 0 #8): fail before trusting anything else about the turn.
+  if (outcome.setModelError != null) {
+    finishAttempt("failed", "failed", {
+      reason: "worker_failed",
+      set_model_error: outcome.setModelError,
+      stop_reason: outcome.stopReason,
+      exit_code: outcome.exitCode,
+      spawn_error: outcome.spawnError,
+      saw_turn_completed: outcome.sawTurnCompleted,
+    });
+    return;
+  }
+  // Accumulated agent message text blew the executor cap: the final message
+  // is (potentially) truncated, so it must never reach the validator looking
+  // complete — fail closed before the success predicate can pass.
+  if (outcome.messageOverflow) {
+    finishAttempt("failed", "failed", {
+      reason: "worker_failed",
+      message_overflow: true,
+      exit_code: outcome.exitCode,
+      spawn_error: outcome.spawnError,
+      saw_turn_completed: outcome.sawTurnCompleted,
+      stop_reason: outcome.stopReason,
+    });
+    return;
+  }
+  // Exit codes are unreliable here too; require turn semantics (stopReason
+  // end_turn) plus a non-empty final message. refusal / max_tokens /
+  // max_turn_requests stop reasons fold into worker_failed via the payload.
+  const streamSuccess =
+    outcome.exitCode === 0 && outcome.sawTurnCompleted && outcome.lastAgentMessage != null;
+  if (!streamSuccess) {
+    finishAttempt("failed", "failed", {
+      reason: "worker_failed",
+      exit_code: outcome.exitCode,
+      spawn_error: outcome.spawnError,
+      saw_turn_completed: outcome.sawTurnCompleted,
+      stop_reason: outcome.stopReason,
+    });
+    return;
+  }
+
+  // ACP has no schema-constrained output; models fence the final JSON in
+  // practice, so the fence is stripped before the shared parse/validate
+  // pipeline (whose validateWorkerResult layer stays the real enforcement).
+  const rawMessage = extractFinalMessageText(outcome.lastAgentMessage);
+  await acceptWorkerMessage(runDir, workflow, state, task, attemptId, attemptDir, handle, runStartedAt, runContext, attempt, outcome, finishAttempt, rawMessage);
 }
 
 function runLocalAttempt(runDir, workflow, state, task, attemptId, attemptDir) {

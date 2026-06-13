@@ -707,6 +707,8 @@ export function validatePluginLayout(options = {}) {
     "scripts/dynamic-workflows.js",
     "scripts/dynamic-workflows-mcp.js",
     "scripts/lib/approval.js",
+    "scripts/lib/acp-client.js",
+    "scripts/lib/acp-executor.js",
     "scripts/lib/claude-executor.js",
     "scripts/lib/codex-executor.js",
     "scripts/lib/commands.js",

@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.7.0 - 2026-06-13
+
+### Added
+
+- New worker kind `acp_opencode`: tasks execute as `opencode acp` subprocesses
+  driven over ACP (Agent Client Protocol, nd-JSON-RPC over stdio), one process
+  per attempt, alongside the existing `codex*` (`codex exec`) and `claude*`
+  (`claude -p`) kinds. Set `CCDW_OPENCODE_BIN` to override the opencode binary
+  (absolute path recommended — PATH wrappers can defeat the isolation env).
+  Verified against opencode 1.16.2.
+- Plan-time rules for acp tasks: only the exact kind `acp_opencode` is
+  accepted (other `acp*` values are rejected); `model` is REQUIRED (ACP model
+  id namespace, e.g. `openrouter/anthropic/claude-haiku-4.5`, fixed per
+  session via `session/set_model` with a failed set_model failing the
+  attempt); `effort`, `profile`, `output_schema`, `route`,
+  `workspace_policy.network:true`, and acting as a `foreach` producer are
+  rejected; foreach children and `gates` are allowed.
+- Approval disclosure for acp tasks: no OS-level sandbox exists — enforcement
+  is the injected opencode permission config (read-only scope denies
+  bash/edit; write scope allows them) plus ccdw auto-rejecting every
+  `session/request_permission` ask, and network isolation is NOT guaranteed in
+  write scope. The approval summary also discloses that write-scope bash can
+  write outside the workspace root, workers inherit non-`OPENCODE_*`
+  environment variables, permission enforcement depends on an honest opencode
+  binary, and `prompt.txt`/`acp-frames.jsonl` artifacts may contain sensitive
+  content. Specs without acp tasks keep byte-identical summaries.
+- opencode config injection and ambient isolation: a per-run generated
+  permission config is injected via a spawn-time env recipe
+  (`XDG_CONFIG_HOME` isolation, `OPENCODE_CONFIG`,
+  `OPENCODE_DISABLE_PROJECT_CONFIG`, and related disable flags) that blocks
+  global/project config, plugins, CLAUDE.md, and skills; the opencode data dir
+  (auth/session DB) remains ambient. Token usage is counted into the run
+  budget from ACP `PromptResponse.usage`. Worker results follow the same JSON
+  envelope, but schema adherence is prompt contract plus runner re-validation
+  only (no CLI-side schema enforcement exists for ACP), so the existing
+  `schema_violation` quarantine/retry applies — prefer codex/claude kinds for
+  schema-critical tasks. Phase 0 verification record:
+  `docs/local/dynamic-workflows-smoke-runs/acp-phase0-20260613/RESULTS.md`.
+- ACP executor hardening: handshake requests have response timeouts while the
+  prompt turn remains attempt-timeout bounded; the attempt timeout is cleared
+  once the prompt settles so teardown cannot relabel a successful turn as
+  `timed_out`; oversized protocol lines and accumulated agent-message text are
+  capped with `messageOverflow` failing closed; `acp-frames.jsonl` is capped at
+  16 MiB per attempt; repeated permission requests are capped in `events.ndjson`
+  with a `permission_request_flood` summary; and the ACP client version is
+  pinned to the plugin release surface. Each ACP attempt also records a
+  best-effort `opencode --version` probe in `launch_started` for audit and
+  smoke-result correlation; probe failures are coarse-status audit data and do
+  not block execution.
+
 ## v0.6.0 - 2026-06-12
 
 ### Changed (breaking)

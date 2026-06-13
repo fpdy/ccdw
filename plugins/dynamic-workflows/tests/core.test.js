@@ -20,6 +20,7 @@ import {
   validatePluginLayout,
   validateRunDirectory,
 } from "../scripts/lib/core.js";
+import { ACP_CLIENT_VERSION } from "../scripts/lib/acp-executor.js";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeCodexBin = path.join(pluginRoot, "tests", "fixtures", "fake-codex.js");
@@ -1854,9 +1855,9 @@ test("workflow schema executor contract stays pinned to shared constants", () =>
   const taskSchema = schema.$defs.task;
 
   assert.deepEqual(EXECUTOR_FIELD_CONTRACT, {
-    model: { codex: true, claude: true, local: false },
-    effort: { codex: false, claude: true, local: false },
-    profile: { codex: true, claude: false, local: false },
+    model: { codex: true, claude: true, acp: true, local: false },
+    effort: { codex: false, claude: true, acp: false, local: false },
+    profile: { codex: true, claude: false, acp: false, local: false },
   });
   assert.equal(schema.$defs.modelValue.pattern, MODEL_VALUE_PATTERN_SOURCE);
   assert.equal(taskSchema.properties.model.$ref, "#/$defs/modelValue");
@@ -1876,6 +1877,23 @@ test("workflow schema executor contract stays pinned to shared constants", () =>
         required: ["kind"],
       },
       then: { not: { required: ["profile"] } },
+    },
+    {
+      if: {
+        properties: { kind: { pattern: EXECUTOR_KIND_MATCHERS.acp } },
+        required: ["kind"],
+      },
+      then: {
+        required: ["model"],
+        not: {
+          anyOf: [
+            { required: ["effort"] },
+            { required: ["profile"] },
+            { required: ["output_schema"] },
+            { required: ["route"] },
+          ],
+        },
+      },
     },
     {
       if: {
@@ -1905,9 +1923,11 @@ test("dynamic workflows release version surfaces are aligned", () => {
   const pluginJson = readJsonFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"));
   const mcpSource = fs.readFileSync(path.join(pluginRoot, "scripts", "dynamic-workflows-mcp.js"), "utf8");
 
-  assert.equal(packageJson.version, "0.6.0");
-  assert.equal(pluginJson.version, "0.6.0");
-  assert.match(mcpSource, /version: "0\.6\.0"/);
+  assert.equal(packageJson.version, "0.7.0");
+  assert.equal(pluginJson.version, "0.7.0");
+  assert.match(mcpSource, /version: "0\.7\.0"/);
+  // The ACP initialize clientInfo.version must track the release version too.
+  assert.equal(ACP_CLIENT_VERSION, packageJson.version);
 });
 
 // Case 1: dispatch routing.

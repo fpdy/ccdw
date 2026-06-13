@@ -18,6 +18,9 @@ export function resolveExecutorKind(kind) {
   if (value.startsWith("claude")) {
     return "claude";
   }
+  if (value.startsWith("acp")) {
+    return "acp";
+  }
   // Unknown kinds keep failing deterministically inside the local path.
   return "local";
 }

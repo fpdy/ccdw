@@ -1,3 +1,4 @@
+import { buildOpencodeWorkerConfig } from "./acp-executor.js";
 import {
   ADVISORY_SPEC_FIELDS,
   SCHEMA_VERSION,
@@ -6,8 +7,9 @@ import {
 import { isPlainObject, resolveExecutorKind } from "./util.js";
 
 // Approval-summary view of the enforced sandbox. The per-executor breakdown is
-// emitted only when the workflow contains a claude-kind task: codex-only
-// summaries must stay byte-identical to the pre-claude format.
+// emitted only when the workflow contains a claude-kind or acp-kind task:
+// codex-only summaries must stay byte-identical to the pre-claude format, and
+// acp-free summaries must stay byte-identical to the pre-acp format (R5).
 function buildExecutionSandboxSummary(workflow, policy) {
   const workspaceWrite = Array.isArray(policy.write_scope) && policy.write_scope.includes("workspace");
   const summary = {
@@ -30,7 +32,8 @@ function buildExecutionSandboxSummary(workflow, policy) {
     };
   }
   const hasClaudeTask = tasks.some((task) => resolveExecutorKind(task?.kind) === "claude");
-  if (!hasClaudeTask) {
+  const hasAcpTask = tasks.some((task) => resolveExecutorKind(task?.kind) === "acp");
+  if (!hasClaudeTask && !hasAcpTask) {
     return summary;
   }
   const hasCodexTask = tasks.some((task) => resolveExecutorKind(task?.kind) === "codex");
@@ -38,15 +41,49 @@ function buildExecutionSandboxSummary(workflow, policy) {
   if (hasCodexTask) {
     executors.codex = { sandbox: workspaceWrite ? "workspace-write" : "read-only" };
   }
-  executors.claude = {
-    permission_mode: workspaceWrite ? "dontAsk" : "default",
-    tools: workspaceWrite ? "write set" : "read-only set",
-    os_sandbox: workspaceWrite
-      ? `settings (allow write ${policy.workspace_root} / no network)`
-      : `settings (deny write ${policy.workspace_root} / no network)`,
-    setting_sources: "none (all ambient excluded)",
-    customizations: "disabled (--safe-mode)",
-  };
+  if (hasClaudeTask) {
+    executors.claude = {
+      permission_mode: workspaceWrite ? "dontAsk" : "default",
+      tools: workspaceWrite ? "write set" : "read-only set",
+      os_sandbox: workspaceWrite
+        ? `settings (allow write ${policy.workspace_root} / no network)`
+        : `settings (deny write ${policy.workspace_root} / no network)`,
+      setting_sources: "none (all ambient excluded)",
+      customizations: "disabled (--safe-mode)",
+    };
+  }
+  // ACP opencode worker disclosure (spec §4.6, R3a/R3b): no OS sandbox backs
+  // this executor, so every enforcement layer and every guarantee gap is
+  // disclosed verbatim, including the exact permission config ccdw injects.
+  if (hasAcpTask) {
+    executors.acp = {
+      execution:
+        "`opencode acp` subprocess (ACP / nd-JSON-RPC over stdio); 1 attempt = 1 process; cwd = workspace root",
+      binary_resolution:
+        'CCDW_OPENCODE_BIN env override, else "opencode" on PATH (absolute path recommended: PATH wrappers can re-inject ambient env)',
+      os_sandbox:
+        "none (enforcement is app-layer only, two layers; both layers are enforced by the opencode process itself — no protection against a compromised binary or PATH wrapper)",
+      enforcement: {
+        injected_permission_config: buildOpencodeWorkerConfig({ workflow }),
+        permission_requests:
+          "ccdw auto-responds to every session/request_permission with reject (no allow_always; all requests logged)",
+      },
+      network_isolation:
+        "NOT guaranteed: in write scope bash is allowed, so workers can reach the network regardless of the task network field; in read-only scope bash/webfetch/websearch are denied at app layer only (no OS-level guarantee)",
+      filesystem_containment:
+        "NOT guaranteed: in write scope bash is allowed and there is no OS confinement, so workers can write outside the workspace root; the external_directory deny is app-layer only (edit-tool requests)",
+      env_exposure:
+        "worker inherits the parent environment (minus OPENCODE_*); in write scope it can read inherited secrets (e.g. provider API keys) via bash",
+      ambient_isolation:
+        "global config / project opencode.json / plugins / CLAUDE.md & skills blocked via env recipe (XDG_CONFIG_HOME isolation + OPENCODE_DISABLE_PROJECT_CONFIG etc., verified opencode 1.16.2); opencode data dir (auth + session DB) remains ambient; model pinned per session via session/set_model (task.model, required for acp tasks)",
+      token_budget:
+        "usage counted from ACP PromptResponse.usage (verified opencode 1.16.2; not guaranteed to match provider billing; worker-reported, so not trustworthy against a compromised binary)",
+      artifact_sensitivity:
+        "attempt artifacts (prompt.txt, acp-frames.jsonl) contain the full rendered prompt and raw agent frames and may include sensitive content; treat the run dir as sensitive",
+      provider_availability:
+        "plugin-dependent providers (e.g. Anthropic OAuth, GitHub Copilot) unavailable under isolation; only API-key-env providers work",
+    };
+  }
   summary.executors = executors;
   return summary;
 }

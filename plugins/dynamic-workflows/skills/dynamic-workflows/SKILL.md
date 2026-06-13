@@ -1,13 +1,14 @@
 ---
 name: dynamic-workflows
-description: Decompose a large task into a declarative workflow and run it as parallel codex exec or claude -p subagents with approval gates, budgets, typed task outputs, command gates, enum branching, bounded fan-out, progress polling, resume, and cancellation. Use for audits, migrations, research, and other work with 5+ independent subtasks that need fan-out and verification. This plugin does not hook or replace the built-in /goal command.
+description: Decompose a large task into a declarative workflow and run it as parallel codex exec, claude -p, or opencode ACP subagents with approval gates, budgets, typed task outputs, command gates, enum branching, bounded fan-out, progress polling, resume, and cancellation. Use for audits, migrations, research, and other work with 5+ independent subtasks that need fan-out and verification. This plugin does not hook or replace the built-in /goal command.
 ---
 
 # Dynamic Workflows
 
 You are the planner. The runner validates your plan, schedules tasks as real
-`codex exec` or `claude -p` subagents (or deterministic local tasks), enforces
-budgets fail-closed, and persists everything for resume and audit.
+`codex exec`, `claude -p`, or `opencode acp` subagents (or deterministic local
+tasks), enforces budgets fail-closed, and persists everything for resume and
+audit.
 
 ## When to use
 
@@ -34,10 +35,15 @@ CLI (2.1.x or later) on PATH. claude workers run with all ambient settings
 excluded (`--setting-sources ""`), so `apiKeyHelper`-based auth does not reach
 them — such environments must export `ANTHROPIC_API_KEY` to the orchestrator's
 environment — and the user-level `model` setting does not apply either, so set
-a task-level `model` if you need a specific one.
+a task-level `model` if you need a specific one. acp_opencode tasks require
+the `opencode` CLI (verified against 1.16.2); set `CCDW_OPENCODE_BIN` (an
+absolute path is recommended — PATH wrappers can defeat the isolation env) to
+override the binary.
 
 Task-level executor fields are strict: `model` works for codex and claude
-tasks, `profile` works only for codex tasks, `effort` works only for claude
+tasks and is REQUIRED for acp_opencode tasks (an ACP model id such as
+`openrouter/anthropic/claude-haiku-4.5`), `profile` works only for codex
+tasks, `effort` works only for claude
 tasks (`low`, `medium`, `high`, `xhigh`, `max`), and local tasks must not
 carry any of them. `model` and `profile` values must match
 `^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$`; spawned executor values are also
@@ -97,13 +103,15 @@ rejected ("unsupported schema_version; re-plan required"); re-plan them.
   user-supplied path fragments in ids.
 - Tasks with `kind` starting with `codex` run as `codex exec` subagents;
   kinds starting with `claude` (e.g. `claude_agent`) run as `claude -p`
-  subagents; `local_*` kinds are deterministic no-LLM steps (and reject
+  subagents; the exact kind `acp_opencode` runs as an `opencode acp` worker
+  over ACP (any other `acp*` value is rejected at plan time); `local_*` kinds
+  are deterministic no-LLM steps (and reject
   `output_schema`/`gates`/`route`/`foreach`). Workers run read-only unless
   `workspace_policy.write_scope` includes `"workspace"`.
 - The runner rejects `workspace_policy.shell:true` and `mcp_write:true`; the
   approval summary reports the actually enforced worker sandbox and network
   access instead. `workspace_policy.network:true` is rejected at plan time for
-  workflows containing claude tasks.
+  workflows containing claude or acp_opencode tasks.
 - Conditions must match what the engine actually does: `entry_condition` /
   `condition` accept only `"always"` (empty `depends_on`) or
   `"dependencies_succeeded"`, `completion_condition` only
@@ -115,8 +123,8 @@ rejected ("unsupported schema_version; re-plan required"); re-plan them.
   resolve relative to the run directory. `input_source` passes file contents
   to the worker; templates (below) embed values into the prompt text — they
   coexist, pick per channel.
-- Keep `max_concurrency` low (2-4); each worker is a full codex or claude
-  session.
+- Keep `max_concurrency` low (2-4); each worker is a full codex, claude, or
+  opencode session.
 - Set per-task `timeout_ms` and a run-level `max_tokens`; the runner enforces
   both fail-closed. Token accounting is approximate (cached input tokens are
   not counted, multi-turn input is re-counted per turn), so leave margin.
@@ -125,6 +133,46 @@ rejected ("unsupported schema_version; re-plan required"); re-plan them.
   `retry_policy` for retries).
 - Use a verification phase that tries to REFUTE earlier findings rather than
   restate them.
+
+### acp_opencode tasks
+
+`acp_opencode` tasks run as `opencode acp` subprocesses driven over ACP
+(nd-JSON-RPC over stdio), one process per attempt. Constraints:
+
+- `model` is REQUIRED (ACP model id namespace, e.g.
+  `openrouter/anthropic/claude-haiku-4.5`); the runner fixes it per session
+  via `session/set_model` and fails the attempt if that fails. Only API-key
+  env providers are available under isolation (plugin-based providers such as
+  Anthropic OAuth or GitHub Copilot are not).
+- Rejected at plan time: `effort`, `profile`, `output_schema`, `route`,
+  `network: true`, and being a `foreach` producer. An acp_opencode task CAN be
+  a foreach child and CAN have `gates`.
+- No OS-level sandbox exists. Enforcement is application-layer only: an
+  injected opencode permission config (read-only scope denies bash/edit;
+  write scope allows them) plus ccdw auto-rejecting every permission ask.
+  Network isolation is NOT guaranteed in write scope (bash is allowed), and
+  in write scope workers can also write outside the workspace root and read
+  inherited environment secrets (e.g. provider API keys) via bash. All
+  of this is disclosed in the approval summary.
+- Ambient opencode config (global/project config, plugins, CLAUDE.md, skills)
+  is blocked via the spawn-time env recipe; the opencode data dir
+  (auth/session DB) remains ambient.
+- Operational bounds are fail-closed: setup requests time out, the prompt is
+  bounded by `timeout_ms`, oversized protocol lines are dropped, cumulative
+  agent message text over 4 MiB fails the attempt, `acp-frames.jsonl` is capped
+  at 16 MiB, and permission asks are logged individually only up to 20 before a
+  flood summary. `launch_started` records a best-effort `opencode --version`
+  probe for audit.
+- Token usage IS counted into `max_tokens` from ACP `PromptResponse.usage`, but
+  it is worker-reported and not trustworthy against a compromised binary.
+- Treat ACP attempt artifacts as sensitive: `prompt.txt` and
+  `acp-frames.jsonl` may contain rendered prompts, raw frames, and secrets from
+  task inputs.
+- Results use the same JSON envelope as other workers, but there is no
+  CLI-side schema enforcement for ACP — adherence is prompt contract plus
+  runner re-validation, so `schema_violation` quarantine/retry applies.
+  Prefer codex/claude kinds for schema-critical tasks; use acp_opencode for
+  free-form, read, or analysis tasks.
 
 ### Typed outputs (`output_schema`)
 

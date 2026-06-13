@@ -108,7 +108,10 @@
       "properties": {
         "task_id": { "$ref": "#/$defs/specId" },
         "phase_id": { "$ref": "#/$defs/specId" },
-        "kind": { "type": "string" },
+        "kind": {
+          "type": "string",
+          "description": "Executor selection. Kinds starting with \"codex\" run as codex exec subagents, kinds starting with \"claude\" as claude -p subagents, the exact kind \"acp_opencode\" as an opencode worker driven over ACP (other acp* values are rejected at plan time), and other kinds as deterministic local tasks."
+        },
         "role": { "type": "string" },
         "prompt_template": {
           "type": "string",
@@ -154,7 +157,10 @@
         "retry_policy": { "$ref": "#/$defs/retryPolicy" },
         "stop_condition": { "const": "budget_or_cancelled" },
         "timeout_ms": { "type": "integer", "minimum": 1 },
-        "model": { "$ref": "#/$defs/modelValue" },
+        "model": {
+          "$ref": "#/$defs/modelValue",
+          "description": "Worker model id. Optional for codex and claude tasks; REQUIRED for acp_opencode tasks, where it is an ACP model id (e.g. \"openrouter/anthropic/claude-haiku-4.5\") fixed per session via session/set_model."
+        },
         "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
         "profile": { "$ref": "#/$defs/modelValue" },
         "outputs": { "type": "array", "items": { "type": "string" } }
@@ -176,7 +182,24 @@
         },
         {
           "if": {
-            "properties": { "kind": { "pattern": "^(?!codex|claude)" } },
+            "properties": { "kind": { "pattern": "^acp" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["model"],
+            "not": {
+              "anyOf": [
+                { "required": ["effort"] },
+                { "required": ["profile"] },
+                { "required": ["output_schema"] },
+                { "required": ["route"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "pattern": "^(?!codex|claude|acp)" } },
             "required": ["kind"]
           },
           "then": {

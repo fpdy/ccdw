@@ -4,15 +4,16 @@ export const ARGV_SAFE_VALUE_PATTERN = /^[^\s\x00-\x1f\x7f-\x9f-][^\s\x00-\x1f\x
 export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
 export const EXECUTOR_FIELD_CONTRACT = {
-  model: { codex: true, claude: true, local: false },
-  effort: { codex: false, claude: true, local: false },
-  profile: { codex: true, claude: false, local: false },
+  model: { codex: true, claude: true, acp: true, local: false },
+  effort: { codex: false, claude: true, acp: false, local: false },
+  profile: { codex: true, claude: false, acp: false, local: false },
 };
 
 export const EXECUTOR_KIND_MATCHERS = {
   codex: "^codex",
   claude: "^claude",
-  local: "^(?!codex|claude)",
+  acp: "^acp",
+  local: "^(?!codex|claude|acp)",
 };
 
 export function pushSafeWorkerArg(args, flag, value, label) {

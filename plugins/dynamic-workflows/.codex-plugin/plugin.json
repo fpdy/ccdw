@@ -1,7 +1,7 @@
 {
   "name": "dynamic-workflows",
-  "version": "0.6.0",
-  "description": "Plan, run, resume, and audit local declarative workflows with codex exec or claude -p subagents.",
+  "version": "0.7.0",
+  "description": "Plan, run, resume, and audit local declarative workflows with codex exec, claude -p, or opencode ACP subagents.",
   "author": {
     "name": "fpdy"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Dynamic Workflows",
     "shortDescription": "Run declarative subagent workflows locally.",
-    "longDescription": "Dynamic Workflows gives Codex a local workflow runner with approval gates, run snapshots, append-only events, resume, cancellation, structured worker results from codex exec or claude -p subagents, deterministic local tasks, and an optional MCP interface. It intentionally does not hook or replace the built-in /goal command.",
+    "longDescription": "Dynamic Workflows gives Codex a local workflow runner with approval gates, run snapshots, append-only events, resume, cancellation, structured worker results from codex exec, claude -p, or opencode ACP subagents, deterministic local tasks, and an optional MCP interface. It intentionally does not hook or replace the built-in /goal command.",
     "developerName": "fpdy",
     "category": "Developer Tools",
     "capabilities": [

@@ -8,7 +8,7 @@ This repository currently hosts local Codex agent assets and a Dynamic
 Workflows plugin implementation.
 
 Dynamic Workflows turns a task plan into a local declarative workflow run
-executed by real `codex exec` or `claude -p` subagents. The calling agent authors a
+executed by real `codex exec`, `claude -p`, or `opencode acp` subagents. The calling agent authors a
 WorkflowSpec (JSON, or YAML via the CLI); the runner validates it, schedules tasks in parallel with
 fail-closed budgets, and writes a workflow specification, runtime state, an
 append-only event log, and task artifacts so the workflow can be approved,
@@ -50,7 +50,7 @@ Each run directory contains:
 - `events.ndjson`: an append-only protocol and audit event log.
 - `artifacts/`: structured worker results and per-attempt raw output.
 
-Three executors are built in:
+Four executors are built in:
 
 - **codex executor**: tasks whose `kind` starts with `codex` run as
   `codex exec` subprocesses with a JSONL event stream, schema-enforced
@@ -66,10 +66,22 @@ Three executors are built in:
   into the run budget. Set `CCDW_CLAUDE_BIN` to override the binary.
   `workspace_policy.network:true` is rejected at plan time for workflows
   containing claude tasks.
+- **acp_opencode executor**: tasks whose `kind` is exactly `acp_opencode`
+  (other `acp*` values are rejected at plan time) run as `opencode acp`
+  subprocesses driven over ACP (nd-JSON-RPC over stdio), one process per
+  attempt. A task-level `model` is required (ACP model id, e.g.
+  `openrouter/anthropic/claude-haiku-4.5`); `output_schema`, `route`,
+  `effort`, `profile`, and `network: true` are rejected. There is no OS-level
+  sandbox: enforcement is an injected opencode permission config plus ccdw
+  auto-rejecting all permission asks, and network isolation is not guaranteed
+  in write scope — the approval summary discloses this. Token usage is
+  counted into the run budget from ACP `PromptResponse.usage`. Set
+  `CCDW_OPENCODE_BIN` to override the binary (absolute path recommended).
 - **local executor**: deterministic `local_*` task kinds used by the default
   template and the test suite; no LLM sessions are spawned.
 
-Task-level `model` is supported for codex and claude tasks. `profile` is
+Task-level `model` is supported for codex and claude tasks and required for
+acp_opencode tasks. `profile` is
 codex-only, `effort` is claude-only (`low`, `medium`, `high`, `xhigh`, `max`),
 and local tasks reject all executor fields in new plans. Approval summaries
 include these fields when present, and spawned executors reject argv-unsafe
@@ -139,9 +151,11 @@ swapped `workflow.yaml`.
 - The `codex` CLI on PATH (only for workflows that use codex tasks).
 - The `claude` CLI, 2.1.x or later, on PATH (only for workflows that use
   claude tasks).
+- The `opencode` CLI on PATH, or `CCDW_OPENCODE_BIN` pointing at an absolute
+  opencode binary (only for workflows that use `acp_opencode` tasks).
 
 No package installation is required for the test suite; tests exercise the
-codex and claude executors through bundled fake binaries.
+codex, claude, and ACP opencode executors through bundled fake binaries.
 
 ## Quick Start
 

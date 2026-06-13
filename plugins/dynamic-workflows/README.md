@@ -1,7 +1,8 @@
 # Dynamic Workflows
 
 Dynamic Workflows is a local Codex plugin that runs a caller-authored
-declarative workflow as real `codex exec` or `claude -p` subagents: the
+declarative workflow as real `codex exec`, `claude -p`, or `opencode acp`
+subagents: the
 planning agent writes
 a WorkflowSpec (JSON or YAML), the runner validates it, schedules tasks in parallel up to
 `max_concurrency`, enforces token/duration/agent budgets fail-closed, and
@@ -37,8 +38,40 @@ ambient settings are excluded, `apiKeyHelper`-based auth is not available to
 workers (export `ANTHROPIC_API_KEY` instead) and the user-level `model`
 setting does not apply (use the task-level `model` field).
 
+Tasks with `kind` exactly `acp_opencode` (any other `acp*` value is rejected
+at plan time) execute as `opencode acp` subprocesses driven over ACP (Agent
+Client Protocol, nd-JSON-RPC over stdio), one process per attempt. They
+REQUIRE a task-level `model` (ACP model id namespace, e.g.
+`openrouter/anthropic/claude-haiku-4.5`), fixed per session via
+`session/set_model`; `effort`, `profile`, `output_schema`, `route`,
+`network: true`, and acting as a `foreach` producer are rejected at plan time
+(foreach children and `gates` are allowed). There is no OS-level sandbox:
+enforcement is an injected opencode permission config (read-only scope denies
+bash/edit; write scope allows them) plus ccdw auto-rejecting every
+`session/request_permission` ask, so network isolation is NOT guaranteed in
+write scope — the approval summary discloses this. In write scope workers can
+also write outside the workspace root and read inherited environment secrets
+(e.g. provider API keys) via bash. Ambient opencode config
+(global/project config, plugins, CLAUDE.md, skills) is blocked via a
+spawn-time env recipe; the opencode data dir (auth/session DB) remains
+ambient. Token usage is counted into the run budget from ACP
+`PromptResponse.usage`. Results follow the same JSON envelope, but schema
+adherence is prompt contract plus runner re-validation only (no CLI-side
+schema enforcement exists for ACP), so `schema_violation` quarantine/retry
+applies; prefer codex/claude kinds for schema-critical tasks and acp_opencode
+for free-form, read, or analysis tasks. Set `CCDW_OPENCODE_BIN` to override
+the opencode binary (an absolute path is recommended — PATH wrappers can
+defeat the isolation env). Verified against opencode 1.16.2. Operational
+hardening: setup requests have bounded response timeouts, the prompt turn is
+bounded by the attempt timeout, oversized protocol lines are dropped, cumulative
+agent-message text over 4 MiB fails closed with `message_overflow`,
+`acp-frames.jsonl` is capped at 16 MiB, permission asks are logged individually
+only up to 20 before a `permission_request_flood` summary, and `launch_started`
+records a best-effort `opencode --version` probe.
+
 Task-level executor fields are explicit and approval-visible. `model` applies
-to codex and claude tasks, `profile` applies only to codex tasks (an explicit
+to codex and claude tasks and is required for acp_opencode tasks, `profile`
+applies only to codex tasks (an explicit
 task `model` remains visible in argv and wins over any profile model setting),
 and `effort` applies only to claude tasks with one of `low`, `medium`, `high`,
 `xhigh`, or `max`. Plans reject unsupported combinations, local-task
@@ -57,7 +90,9 @@ filesystem writes are limited to the workspace root); network access is only
 passed through for codex tasks in that workspace-write mode.
 `workspace_policy.network:true` is rejected at plan time for workflows
 containing claude tasks because the claude sandbox has no enforceable
-allow-all network mechanism. The runner rejects `workspace_policy.shell:true`
+allow-all network mechanism, and for workflows containing acp_opencode tasks
+because opencode has no OS sandbox at all. The runner rejects
+`workspace_policy.shell:true`
 and `workspace_policy.mcp_write:true` because those permissions are not
 enforced by the current worker invocations.
 

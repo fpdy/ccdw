@@ -174,6 +174,17 @@ export function validateWorkflowSpec(workflow) {
       "workspace_policy.network: true is not supported for claude tasks (no enforceable allow-all network sandbox)",
     );
   }
+  // Fail-closed (design D6): opencode has no OS-level sandbox, so the acp
+  // executor cannot enforce any network guarantee either way; network: true
+  // would promise an allow-all sandbox that does not exist.
+  const hasAcpTask = (Array.isArray(workflow.tasks) ? workflow.tasks : []).some(
+    (task) => resolveExecutorKind(task?.kind) === "acp",
+  );
+  if (hasAcpTask && isPlainObject(workflow.workspace_policy) && workflow.workspace_policy.network === true) {
+    errors.push(
+      "workspace_policy.network: true is not supported for acp tasks (no enforceable network sandbox)",
+    );
+  }
   if (workflow?.verification_policy !== undefined) {
     errors.push("workflow.verification_policy was removed in schema v2; express verification with task gates");
   }
@@ -222,6 +233,12 @@ export function validateWorkflowSpec(workflow) {
     requireString(task, "phase_id", errors, `task:${task.task_id}`);
     validateSpecId(task.phase_id, `task ${task.task_id} phase_id`, errors);
     requireString(task, "kind", errors, `task:${task.task_id}`);
+    // Design D1: the acp executor kind reserves the whole "acp" prefix, but
+    // only acp_opencode is a verified agent; every other acp* kind is
+    // rejected fail-closed instead of falling through to a worker launch.
+    if (resolveExecutorKind(task.kind) === "acp" && task.kind !== "acp_opencode") {
+      errors.push(`task ${task.task_id}: Unsupported acp kind: ${task.kind}. Supported: acp_opencode`);
+    }
     requireString(task, "role", errors, `task:${task.task_id}`);
     requireString(task, "prompt_template", errors, `task:${task.task_id}`);
     requireArray(task, "depends_on", errors, `task:${task.task_id}`);
@@ -253,8 +270,14 @@ export function validateWorkflowSpec(workflow) {
       errors.push(`task ${task.task_id} verification_required was removed in schema v2; express verification with task gates`);
     }
     if (task.output_schema !== undefined) {
-      if (resolveExecutorKind(task.kind) === "local") {
+      const outputSchemaKind = resolveExecutorKind(task.kind);
+      if (outputSchemaKind === "local") {
         errors.push(`task ${task.task_id} output_schema is not supported for local tasks`);
+      }
+      // Design R4/D4: ACP v1 has no schema-constrained final output, so typed
+      // output_schema cannot be CLI-enforced for acp tasks.
+      if (outputSchemaKind === "acp") {
+        errors.push(`task ${task.task_id} output_schema is not supported for acp tasks`);
       }
       for (const message of validateOutputSchemaDecl(task.output_schema).errors) {
         errors.push(`task ${task.task_id} ${message}`);
@@ -445,6 +468,17 @@ function validateSpecId(value, label, errors) {
 
 function validateTaskExecutorFields(task, errors) {
   const executorKind = resolveExecutorKind(task.kind);
+  // Design D5-r2: without an explicit model the ACP session silently falls
+  // back to the ambient default in opencode's data dir, breaking determinism,
+  // so acp tasks must pin one (the executor enforces it via session/set_model).
+  if (
+    executorKind === "acp" &&
+    (task.model == null || (typeof task.model === "string" && task.model.trim() === ""))
+  ) {
+    errors.push(
+      `task ${task.task_id} acp tasks require model (ACP model id, e.g. "openrouter/anthropic/claude-haiku-4.5")`,
+    );
+  }
   validateExecutorStringField(task, "model", executorKind, errors);
   validateExecutorStringField(task, "profile", executorKind, errors);
   validateExecutorEffortField(task, executorKind, errors);
@@ -630,8 +664,14 @@ function validateTaskRoute(task, errors) {
     return;
   }
   const prefix = `task ${task.task_id}`;
-  if (resolveExecutorKind(task.kind) === "local") {
+  const routeKind = resolveExecutorKind(task.kind);
+  if (routeKind === "local") {
     errors.push(`${prefix} route is not supported for local tasks`);
+  }
+  // Design D4: route resolution rides on the typed worker envelope's route
+  // enum, which acp tasks cannot have (output_schema is rejected).
+  if (routeKind === "acp") {
+    errors.push(`${prefix} route is not supported for acp tasks`);
   }
   // V5: route and foreach are mutually exclusive (forward-compatible check;
   // foreach lands with F6).
@@ -986,6 +1026,15 @@ function validateForeachTopology(workflow, errors) {
     if (!dependencyClosure(task.task_id, taskById, closures).has(ref.taskId)) {
       errors.push(
         `${label}: task ${ref.taskId} is not in the depends_on transitive closure of task ${task.task_id}; references require an explicit dependency path`,
+      );
+      continue;
+    }
+    // Design D4: acp tasks reject output_schema, so they have no typed output
+    // to drive an expansion — even the default-envelope arrays (e.g.
+    // result.findings) are prompt-instructed only, never CLI-enforced.
+    if (resolveExecutorKind(producer.kind) === "acp") {
+      errors.push(
+        `${label}: task ${ref.taskId} is an acp task; acp tasks have no typed output and cannot be a foreach items producer`,
       );
       continue;
     }
